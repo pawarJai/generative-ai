@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+
+# Environment / secrets
+.env
+
+# Vector store / model caches
+chroma_bge/
+docling_cache/
+.deepeval/
+
+# Runtime state & logs
+file_registry.db
+jobs.db
+interaction_log.jsonl
+
+# User data — ingested uploads and generated exports
+uploads/
+outputs/
+
+# Editor / OS
+.vscode/
+.DS_Store

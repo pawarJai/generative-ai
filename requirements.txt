@@ -1,0 +1,34 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+python-dotenv
+pandas
+openpyxl
+xlrd
+duckdb
+duckdb-engine
+sqlalchemy
+langchain-community
+
+# LLM / RAG stack
+langchain-openai
+langchain-huggingface
+langchain-chroma
+langchain-core
+langchain-classic
+langchain-text-splitters
+docling
+docling-core
+sentence-transformers
+
+# document generation
+python-docx
+python-pptx
+matplotlib
+
+# OCR fallback
+pytesseract
+pdf2image
+ftfy
+Pillow
