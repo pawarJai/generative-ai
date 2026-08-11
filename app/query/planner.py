@@ -98,7 +98,18 @@ def _plan_query_raw(prompt: str, fid: Optional[str]) -> QueryPlan:
         r"pdf|export|working.?sheet|cover.?sheet|record|dataset|report|page\s*\d+|"
         r"generate|create|save|summary|summarize|overview|toc|chapter|section)\b", p)
     if not file_language:
-        return QueryPlan(intent="general")
+        # Genuine general-knowledge cues (math, weather, trivia) always win, even
+        # with a file active — "what is 25 * 4" must never search the document.
+        generic_knowledge = re.search(
+            r"(\d+\s*[\+\-\*/]\s*\d+)|"
+            r"\b(weather|forecast|temperature in|fun fact|trivia|who is|who was|"
+            r"capital of|define|meaning of)\b", p)
+        if generic_knowledge or not fid:
+            return QueryPlan(intent="general")
+        # No file/data keywords, but a file IS actively selected and this isn't a
+        # generic-knowledge question — fall through to the DATA questions logic
+        # below instead of dead-ending in the general agent, which has no tool to
+        # read the uploaded file at all (e.g. "what is the total quantity").
 
     # ---------------------------------------------------------------
     # DATA questions. One intent, no per-phrasing categories: the
@@ -112,6 +123,8 @@ def _plan_query_raw(prompt: str, fid: Optional[str]) -> QueryPlan:
     # ---------------------------------------------------------------
     scope_candidates = resolve_file_scope(prompt) or ([fid] if fid else list(state.FILE_ORDER))
     is_tabular_scope = any(state.FILE_KIND.get(f) == "tabular" for f in scope_candidates)
+    if not is_tabular_scope and re.search(r"\b(sheets?|csv|xlsx?)\b", p):
+        is_tabular_scope = True
     data_fact_cues = re.search(
         r"\b(rows?|records?|how many|total|count|find|filter|value|list|show|give|"
         r"user_id|user[_ ]name|columns?|fields?|sheets?|tables?|data\b|combine|merge)\b", p)
@@ -135,7 +148,8 @@ def _plan_query_raw(prompt: str, fid: Optional[str]) -> QueryPlan:
        and not re.search(r"\bpage\s*\d+\b", p):
         return QueryPlan(intent="table_of_contents", sink=detected_sink, filename=filename)
     if re.search(r"\b(how many tables?|what tables?|table data|tables? (are|is) (there|present|found)|"
-                 r"describe the tables?|what.?s in the tables?|columns?|headers?|fields?)\b", p) \
+                 r"describe the tables?|what.?s in the tables?|"
+                 r"(what|list|show|get|give( me)?|all) (the )?(columns?|headers?|fields?))\b", p) \
        and not re.search(r"\bpage\s*\d+\b", p) \
        and not re.search(r"columns?\s*[:=]", p):
         return QueryPlan(intent="list_columns", sink=detected_sink, filename=filename)
@@ -149,9 +163,10 @@ def _plan_query_raw(prompt: str, fid: Optional[str]) -> QueryPlan:
                "example they gave — never pulls from the uploaded document.\n"
                "- intent='export' ONLY if they want EXISTING data pulled FROM the uploaded "
                "document and saved.\n"
+               "- intent='data_query' for any factual or tabular questions (filters, counts, values, lookup).\n"
                "- 'sink' = file format to ALSO save as, if any. A plain question has sink=null.\n"
                "- If they mention a specific page number -> page_lookup.\n"
-               "- If they ask what columns/headers/fields exist -> list_columns.\n"
+               "- If they ask what columns/headers/fields exist -> list_columns (do NOT use for filtering or querying by column).\n"
                "- If the request needs several different outputs/steps -> complex.\n"
                "- Only fill filename/rename/columns if the user actually said them.")
         plan = planner.invoke([("system", sys), ("human", prompt)])

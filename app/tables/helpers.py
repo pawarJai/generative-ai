@@ -17,12 +17,16 @@ def dedupe_columns(cols) -> List[str]:
     seen: Dict[str, int] = {}
     out = []
     for i, c in enumerate(cols):
-        name = str(c).strip() or f"col_{i}"
-        if name in seen:
-            seen[name] += 1
-            name = f"{name}_{seen[name]}"
-        else:
-            seen[name] = 0
+        name = str(c).strip()
+        if name.lower().startswith("unnamed:"):
+            name = ""
+        name = name or f"col_{i}"
+        
+        base_name = name
+        while name in seen:
+            seen[base_name] += 1
+            name = f"{base_name}_{seen[base_name]}"
+        seen[name] = 0
         out.append(name)
     return out
 

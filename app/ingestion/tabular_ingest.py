@@ -4,12 +4,31 @@ on real-world messy spreadsheets: (1) pd.read_excel reads a merged cell's
 value only into the top-left cell, NaN elsewhere; (2) it always assumes
 row 0 is the header, which is wrong for sheets with a title/logo block above
 the real header row."""
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import pandas as pd
 import openpyxl
 from app import state
 from app.tables.helpers import dedupe_columns
 from app.embedding import embed_text
+
+
+def _df_to_text(df: pd.DataFrame) -> str:
+    lines = []
+    for _, row in df.iterrows():
+        vals = [str(v).strip() for v in row if pd.notna(v) and str(v).strip()]
+        if vals:
+            lines.append(" | ".join(vals))
+    return "\n".join(lines)
+
+
+def _clean_raw_sheet(df: pd.DataFrame, sheet_name: str) -> Optional[pd.DataFrame]:
+    raw_cleaned = df.dropna(axis=1, how="all").dropna(axis=0, how="all").reset_index(drop=True)
+    if raw_cleaned.empty:
+        return None
+    cols = [f"col_{i}" for i in range(len(raw_cleaned.columns))]
+    raw_cleaned.columns = dedupe_columns(cols)
+    raw_cleaned.attrs["page"] = f"{sheet_name}_Raw"
+    return raw_cleaned
 
 
 def _unmerge_and_fill(path: str, sheet_name: str) -> pd.DataFrame:
@@ -82,12 +101,22 @@ def _clean_block_to_table(block: pd.DataFrame) -> Optional[pd.DataFrame]:
     return data.reset_index(drop=True)
 
 
-def _ingest_xls_legacy(path: str) -> list:
+def _ingest_xls_legacy(path: str) -> Tuple[List[pd.DataFrame], List[str]]:
     """Read old-format .xls files via xlrd (openpyxl can't handle them)."""
     sheets = pd.read_excel(path, sheet_name=None, engine="xlrd", header=None)
     tables = []
+    all_text = []
     for sheet_name, raw_df in sheets.items():
         raw_df = raw_df.reset_index(drop=True)
+        
+        sheet_text = _df_to_text(raw_df)
+        if sheet_text:
+            all_text.append(f"--- Sheet: {sheet_name} ---\n{sheet_text}")
+            
+        raw_clean = _clean_raw_sheet(raw_df, sheet_name)
+        if raw_clean is not None:
+            tables.append(raw_clean)
+
         blocks = _split_blocks(raw_df)
         for bi, block in enumerate(blocks):
             cleaned = _clean_block_to_table(block)
@@ -95,18 +124,29 @@ def _ingest_xls_legacy(path: str) -> list:
                 label = sheet_name if len(blocks) == 1 else f"{sheet_name} (block {bi + 1})"
                 cleaned.attrs["page"] = label
                 tables.append(cleaned)
-    return tables
+    return tables, all_text
 
 
 def ingest_tabular(path: str, file_id: str) -> None:
     import os
     ext = os.path.splitext(path)[1].lower()
     tables = []
+    all_text = []
+    
     if ext == ".xls":
-        tables = _ingest_xls_legacy(path)
+        tables, all_text = _ingest_xls_legacy(path)
     elif ext == ".xlsx":
         for sheet_name in pd.ExcelFile(path).sheet_names:
             raw = _unmerge_and_fill(path, sheet_name)
+            
+            sheet_text = _df_to_text(raw)
+            if sheet_text:
+                all_text.append(f"--- Sheet: {sheet_name} ---\n{sheet_text}")
+                
+            raw_clean = _clean_raw_sheet(raw, sheet_name)
+            if raw_clean is not None:
+                tables.append(raw_clean)
+
             blocks = _split_blocks(raw)
             for bi, block in enumerate(blocks):
                 cleaned = _clean_block_to_table(block)
@@ -116,6 +156,10 @@ def ingest_tabular(path: str, file_id: str) -> None:
                     tables.append(cleaned)
     else:
         df = pd.read_csv(path)
+        sheet_text = _df_to_text(df)
+        if sheet_text:
+            all_text.append(f"--- CSV File ---\n{sheet_text}")
+            
         df.columns = dedupe_columns(df.columns)
         df.attrs["page"] = "data"
         tables.append(df)
@@ -125,11 +169,17 @@ def ingest_tabular(path: str, file_id: str) -> None:
     state.FILE_META[file_id] = {"toc": [{"text": f"Sheet/Block: {t.attrs['page']}", "page": t.attrs["page"]}
                                          for t in tables]}
 
-    # Generate description for embedding (skip if no tables found)
+    # Generate description for embedding
+    desc_parts = []
     if tables:
-        desc = "\n\n".join(f"'{t.attrs['page']}' columns: {list(t.columns)}\n{t.head(5).to_string(index=False)}"
-                            for t in tables)
-    else:
-        desc = f"Tabular file with no data tables found: {os.path.basename(path)}"
+        desc_parts.append("Data Tables:\n" + "\n\n".join(
+            f"'{t.attrs['page']}' columns: {list(t.columns)}\n{t.head(5).to_string(index=False)}"
+            for t in tables if not str(t.attrs['page']).endswith("_Raw")))
+    
+    if all_text:
+        desc_parts.append("Full Text Content:\n" + "\n\n".join(all_text))
+        
+    if not desc_parts:
+        desc_parts.append(f"Tabular file with no readable content: {os.path.basename(path)}")
 
-    embed_text(file_id, desc)
+    embed_text(file_id, "\n\n========================\n\n".join(desc_parts))

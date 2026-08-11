@@ -76,6 +76,13 @@ def test_wide_table_row_count_matches_real_data(messy_xlsx):
     assert str(real_rows) in f"{result['text']} {result.get('table')}", (
         f"Expected {real_rows} rows in: {result['text']}")
 
+def test_export_sheet_by_name_returns_dataframe(messy_xlsx):
+    """Test that asking for a specific sheet by name returns the table, not the string name."""
+    result = run_code_on_file(
+        messy_xlsx, "in uploaded last file sheet name = cover sheet")
+    assert result["table"] is not None, f"Expected table data, got: {result['text']}"
+    assert len(result["table"]["rows"]) > 0, "Expected non-empty table rows"
+
 
 def test_malformed_question_gives_honest_failure_not_fabrication(clean_csv):
     """The point is that it must not invent a number for a column that
