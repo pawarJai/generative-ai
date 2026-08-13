@@ -2,6 +2,7 @@
 Each tool is a real function with a real docstring — the LLM reads
 the docstring to decide when to use it. No regex routing.
 """
+import os
 from typing import Optional
 from langchain_core.tools import tool
 from app import state as app_state
@@ -318,6 +319,317 @@ def export_data(question: str, format: str = "excel",
     if not ok:
         return f"Export attempted but verification failed: {verify_msg}"
     return f"{verify_msg}\n\nData preview:\n{df.head(3).to_markdown(index=False)}"
+
+
+def _merge_suffix(display_name: str) -> str:
+    """A short tag that says which document a column came from.
+
+    Derived from the file's own name — never from a fixed list of expected
+    documents. A name ending in a number becomes f<number> ('data-file-2' ->
+    'f2', 'tender 14.pdf' -> 'f14'), which is how users refer to these files
+    in the chat; anything else falls back to a slug of the name.
+    """
+    import re as _re
+    stem = _re.sub(r"[^a-z0-9]+", "", os.path.splitext(str(display_name))[0].lower())
+    trailing = _re.search(r"(\d+)$", stem)
+    return f"f{trailing.group(1)}" if trailing else (stem[:6] or "src")
+
+
+def _side_frame(file_id: str, pages: Optional[list]):
+    """One side of a horizontal merge: (dataframe, error, pages_used).
+
+    Aligned, never pd.concat'd. Concatenating fragments whose columns differ
+    unions them positionally, which is the defect that produced the file this
+    feature exists to replace — outputs/test_f1-2f.xlsx, where data-file-2's
+    34 rows sat under col_0..col_3 with every one of data-file-1's named
+    columns blank beside them.
+    """
+    from app.graph.agent import _restore_file_if_needed
+    from app.tables.helpers import get_all_real_tables, assemble_pages
+    from app.tables.assembly import assemble
+
+    err = _restore_file_if_needed(file_id)
+    if err:
+        return None, err, []
+    if pages:
+        df, _report, used = assemble_pages(file_id, pages)
+        if df is None:
+            return None, f"none of page(s) {pages} hold an extractable table", []
+        return df, None, used
+    tables = get_all_real_tables(file_id)
+    if not tables:
+        return None, "no extractable tables", []
+    df, _report = assemble(tables)
+    if df is None:
+        return None, "no extractable tables", []
+    used = sorted({t.attrs.get("page") for t in tables
+                   if isinstance(t.attrs.get("page"), int)})
+    return df, None, used
+
+
+@tool
+def merge_files_side_by_side(
+    description: str = "",
+    file1_id: str = None,
+    file1_pages: list = None,
+    file2_id: str = None,
+    file2_pages: list = None,
+    output_filename: str = "merged.xlsx",
+) -> str:
+    """Merge data from two files SIDE BY SIDE — left columns from file 1,
+    right columns from file 2. Like a SQL JOIN but without a key column.
+    Row 1 of file1 sits next to Row 1 of file2 in the same spreadsheet row.
+
+    Use when the user says: 'side by side', 'horizontal merge', 'left side
+    right side', 'SQL join style', 'put both tables next to each other'.
+
+    DO NOT use this for stacking rows on top of each other — that is
+    export_data.
+
+    Args:
+        description: What data to take from each file
+        file1_id: First file's file_id (left side)
+        file1_pages: Page numbers to use from file 1 (e.g. [8,9,10])
+        file2_id: Second file's file_id (right side)
+        file2_pages: Page numbers to use from file 2 (e.g. [6,7,8,9,10])
+        output_filename: Output file name (must end in .xlsx)
+    """
+    from app.graph.agent import _resolve_source_specs, _display_name
+    from app.export.exporters import verify_export
+    from app.config import OUTPUT_DIR
+    import pandas as pd
+
+    # Which documents, and which of their pages, comes from the USER's own
+    # words — the same resolver export_data uses. The model's paraphrase drops
+    # page numbers, and picking FILE_ORDER[0]/[-1] instead is the confirmed
+    # worst bug in this project: it reads whichever documents the process
+    # happens to have loaded, not the ones this chat is about.
+    intent_text = app_state.get_current_user_prompt() or description or ""
+    specs = _resolve_source_specs(intent_text, None)
+    if not file1_id and len(specs) >= 2:
+        file1_id, file1_pages = specs[0]["file_id"], file1_pages or specs[0]["pages"]
+    if not file2_id and len(specs) >= 2:
+        file2_id, file2_pages = specs[1]["file_id"], file2_pages or specs[1]["pages"]
+
+    if not file1_id or not file2_id or file1_id == file2_id:
+        loaded = ", ".join(
+            f"{app_state.FILE_ORIGINAL_NAME.get(f, f)} (id={f})"
+            for f in app_state.FILE_ORDER) or "none"
+        return ("A side-by-side merge needs TWO different documents, and the "
+                "request does not say which two. Ask the user to name them. "
+                f"Loaded in this session: {loaded}.")
+
+    name1 = _display_name(file1_id, app_state.FILE_ORIGINAL_NAME.get(file1_id) or file1_id)
+    name2 = _display_name(file2_id, app_state.FILE_ORIGINAL_NAME.get(file2_id) or file2_id)
+
+    df1, err1, used1 = _side_frame(file1_id, file1_pages)
+    if err1:
+        return f"Nothing to merge: '{name1}' — {err1}. No file was created."
+    df2, err2, used2 = _side_frame(file2_id, file2_pages)
+    if err2:
+        return f"Nothing to merge: '{name2}' — {err2}. No file was created."
+
+    sfx1, sfx2 = _merge_suffix(name1), _merge_suffix(name2)
+    if sfx1 == sfx2:
+        sfx1, sfx2 = f"{sfx1}-l", f"{sfx2}-r"
+
+    def _prepare(df, sfx):
+        # Provenance and the context letterhead belong to a single-document
+        # export; side by side they would collide, so they are dropped and
+        # said out loud below rather than half-written.
+        out = df[[c for c in df.columns if not str(c).startswith("_source")]].copy()
+        out.columns = [f"{c}_{sfx}" for c in out.columns]
+        return out.reset_index(drop=True)
+
+    left, right = _prepare(df1, sfx1), _prepare(df2, sfx2)
+
+    # HORIZONTAL merge = axis=1 (side by side, not stacked).
+    merged = pd.concat([left, right], axis=1)
+
+    if not str(output_filename).lower().endswith(".xlsx"):
+        output_filename = f"{os.path.splitext(str(output_filename))[0] or 'merged'}.xlsx"
+    output_filename = os.path.basename(output_filename)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    out_path = os.path.join(OUTPUT_DIR, output_filename)
+    merged.to_excel(out_path, index=False)
+
+    ok, verify_msg = verify_export(out_path, len(merged), "excel", skiprows=0)
+    if not ok:
+        return f"Horizontal merge attempted but verification failed: {verify_msg}"
+
+    # So a later "add the header details to that excel" can modify this file
+    # instead of rebuilding it. The left document is its provenance.
+    app_state.WRITTEN_EXPORTS[output_filename] = {
+        "file_id": file1_id, "context": None,
+        "pages": used1 or None, "sheets": 1,
+    }
+
+    # A side-by-side merge of unequal tables pads the shorter side with blank
+    # cells. That is not a flaw to hide behind a row count — it is the single
+    # thing the user must know before reading the file across.
+    pad = ""
+    if len(left) != len(right):
+        shorter, n = ((name1, len(left)) if len(left) < len(right)
+                      else (name2, len(right)))
+        pad = (f" Row counts differ ({len(left)} vs {len(right)}): the last "
+               f"{abs(len(left) - len(right))} row(s) are blank on the "
+               f"'{shorter}' side, which has only {n} rows. Rows are matched by "
+               f"position, not by any key column.")
+    where1 = f" page(s) {', '.join(map(str, used1))}" if used1 else ""
+    where2 = f" page(s) {', '.join(map(str, used2))}" if used2 else ""
+    return (
+        f"{verify_msg}\n"
+        f"Shape: {merged.shape[0]} rows × {merged.shape[1]} columns.\n"
+        f"Left ({name1}{where1}): {len(left.columns)} columns — "
+        f"{list(left.columns)[:4]}\n"
+        f"Right ({name2}{where2}): {len(right.columns)} columns — "
+        f"{list(right.columns)[:4]}\n"
+        f"No header band was written; a merged file has two source documents "
+        f"and one letterhead would misattribute half of it.{pad}"
+    )
+
+
+def _match_columns(requested: list, available: list):
+    """Requested column names mapped onto the file's real ones, matched
+    loosely on case/spacing/punctuation. Returns (resolved, missing) — the
+    model paraphrases 'SL no_f1' as 'SL_no_f1' constantly, and failing that
+    on an exact string comparison sends the user back to retype it."""
+    import re as _re
+
+    def key(name):
+        return _re.sub(r"[^a-z0-9]+", "", str(name).lower())
+
+    index = {}
+    for col in available:
+        index.setdefault(key(col), col)
+    resolved, missing = [], []
+    for want in requested:
+        hit = index.get(key(want))
+        (resolved if hit is not None else missing).append(hit if hit is not None else want)
+    return resolved, missing
+
+
+@tool
+def combine_columns(
+    source_filename: str,
+    columns_to_combine: list,
+    new_column_name: str,
+    separator: str = " ",
+    output_filename: str = None,
+) -> str:
+    """Combine two or more columns of an ALREADY EXPORTED file into one new
+    column.
+
+    Examples:
+    - first_name + last_name -> full_name
+    - city + state + country -> address_combined
+    - code + description -> item_label
+
+    Use when the user says: 'combine columns', 'merge columns', 'join
+    columns', 'concatenate columns', 'create a new column from'.
+
+    Args:
+        source_filename: The .xlsx file to read (from the outputs folder)
+        columns_to_combine: List of column names to combine
+        new_column_name: Name for the new combined column
+        separator: Character to put between values (default is a space)
+        output_filename: Save as this name (default: source name + _combined)
+    """
+    from app.export.exporters import band_offset, verify_export
+    from app.config import OUTPUT_DIR
+    import pandas as pd
+
+    source_filename = os.path.basename(str(source_filename or ""))
+    source_path = os.path.join(OUTPUT_DIR, source_filename)
+    if not source_filename or not os.path.exists(source_path):
+        available = sorted(f for f in os.listdir(OUTPUT_DIR)
+                           if f.endswith(".xlsx")) if os.path.isdir(OUTPUT_DIR) else []
+        return (f"File '{source_filename}' is not in the outputs folder, so "
+                f"nothing was changed.\nAvailable files: {available[-10:]}")
+
+    if not columns_to_combine or len(columns_to_combine) < 2:
+        return ("Combining needs at least two column names — say which "
+                "columns to join.")
+
+    # Exports from this app can carry a context band (letterhead rows) above
+    # the real header. Reading the file without that offset would take the
+    # band as the column names and report every real column as missing.
+    try:
+        sheet_names = pd.ExcelFile(source_path).sheet_names
+    except Exception as e:
+        return f"Could not read {source_filename}: {e}"
+
+    sheets, offsets = {}, {}
+    for name in sheet_names:
+        off = band_offset(source_path, name)
+        offsets[name] = off
+        sheets[name] = pd.read_excel(source_path, sheet_name=name, skiprows=off)
+
+    # The sheet that actually has the columns, not simply the first one — a
+    # multi-document export writes one sheet per source file, and rewriting
+    # only sheet 1 would silently delete the others.
+    target_sheet, resolved, missing = None, [], []
+    for name, df in sheets.items():
+        hit, miss = _match_columns(columns_to_combine, list(df.columns))
+        if not miss:
+            target_sheet, resolved, missing = name, hit, []
+            break
+        if target_sheet is None:
+            target_sheet, resolved, missing = name, hit, miss
+    if missing:
+        return (f"These columns are not in {source_filename}: {missing}\n"
+                f"Available columns"
+                f"{f' on sheet {target_sheet!r}' if len(sheets) > 1 else ''}: "
+                f"{list(sheets[target_sheet].columns)}\nNothing was changed.")
+
+    df = sheets[target_sheet]
+    blank = {"nan", "none", "nat", "<na>", ""}
+
+    def _join(row):
+        # Values are stringified one at a time rather than with astype(str):
+        # under pandas 3 that leaves a missing cell as a float NaN instead of
+        # the string "nan", and joining it raised AttributeError mid-file.
+        parts = []
+        for value in row:
+            if value is None or (isinstance(value, float) and pd.isna(value)):
+                continue
+            text = str(value).strip()
+            if text.lower() not in blank:
+                parts.append(text)
+        return separator.join(parts)
+
+    df[new_column_name] = df[resolved].apply(_join, axis=1)
+    sheets[target_sheet] = df
+
+    out_filename = os.path.basename(
+        str(output_filename) if output_filename
+        else source_filename.replace(".xlsx", "_combined.xlsx"))
+    if not out_filename.lower().endswith(".xlsx"):
+        out_filename += ".xlsx"
+    out_path = os.path.join(OUTPUT_DIR, out_filename)
+    with pd.ExcelWriter(out_path) as writer:
+        for name, frame in sheets.items():
+            frame.to_excel(writer, sheet_name=name, index=False)
+
+    total = sum(len(f) for f in sheets.values())
+    ok, verify_msg = verify_export(out_path, total, "excel", skiprows=0)
+    if not ok:
+        return f"Column combine attempted but verification failed: {verify_msg}"
+
+    app_state.WRITTEN_EXPORTS[out_filename] = dict(
+        app_state.WRITTEN_EXPORTS.get(source_filename, {}),
+        sheets=len(sheets))
+
+    band_note = (f" The {offsets[target_sheet]} header-band row(s) above the "
+                 f"table were not carried into the new file."
+                 if offsets.get(target_sheet) else "")
+    sample = df[[*resolved, new_column_name]].head(3).to_string(index=False)
+    return (
+        f"{verify_msg}\n"
+        f"Combined {resolved} -> '{new_column_name}'"
+        f"{f' on sheet {target_sheet!r}' if len(sheets) > 1 else ''}.{band_note}\n"
+        f"Sample:\n{sample}"
+    )
 
 
 @tool

@@ -14,7 +14,8 @@ from app.config import llm
 from app.graph.tools import (
     search_documents, query_table_data, list_uploaded_files,
     export_data, get_file_overview, get_page_content, get_table_of_contents,
-    generate_quotation, analyze_past_contracts, modify_export
+    generate_quotation, analyze_past_contracts, modify_export,
+    merge_files_side_by_side, combine_columns
 )
 # Real-world tools for general-knowledge questions that need LIVE data —
 # already implemented and tested in the legacy agent (app/agent/tools.py's
@@ -29,7 +30,13 @@ import os
 import re
 import sqlite3
 
-_EXPORT_TOOL_NAMES = {"export_data", "generate_quotation", "modify_export"}
+# Every tool that writes a file into OUTPUT_DIR. The export backstops read
+# this set to decide whether a file really was produced this turn; a
+# file-writing tool left out of it would be invisible to them, and a
+# successful merge would be "recovered" a second time by export_data —
+# overwriting the side-by-side file with a vertical stack.
+_EXPORT_TOOL_NAMES = {"export_data", "generate_quotation", "modify_export",
+                      "merge_files_side_by_side", "combine_columns"}
 _FABRICATED_FILENAME_RE = re.compile(r"\.(xlsx|csv|docx|pptx|pdf)\b", re.IGNORECASE)
 _SUCCESS_PHRASE_RE = re.compile(
     r"\b(file\s+is\s+ready|ready\s+for\s+download|download\s+ready|"
@@ -1251,8 +1258,20 @@ def _catch_false_missing_file_claim(response_text: str, prompt: str,
 # latch onto "values" from the trailing "column values".
 _COLUMN_ASK_RE = re.compile(
     r"[\"'`]([A-Za-z][\w ()/&.%-]{2,40})[\"'`]\s+column"
-    r"|column\s+(?:name[ds]?\s+)?[\"'`]?([A-Za-z][\w ()/&.%-]{2,40}?)[\"'`]?\s*"
-    r"(?:$|[,.?!]|\s+(?:in|of|from|data|values?|list|column))",
+    r"|column\s+(?:name[ds]?\s+|called\s+)?[\"'`]?([A-Za-z][\w ()/&.%-]{2,40}?)[\"'`]?\s*"
+    r"(?:$|[,.?!]|\s+(?:in|of|from|data|values?|list|column|save|as|with))",
+    re.IGNORECASE)
+
+# Asking for a column that exists is a lookup; asking for one to be BUILT is
+# not. "create a column called item_code" names a column that is supposed to
+# be absent from the source document — that is the point of creating it — and
+# _catch_invented_column read the absence as proof of fabrication, appending a
+# "there is no column named ... ignore the values above" banner to a turn that
+# had just written the column correctly to disk.
+_COLUMN_CREATION_RE = re.compile(
+    r"\b(?:combine|concatenate|join|merge)\b[^.?!]{0,120}?\bcolumns?\b"
+    r"|\bnew\s+column\b"
+    r"|\bcolumns?\s+(?:called|named)\s",
     re.IGNORECASE)
 
 # Words that are part of the request, never the name of a column.
@@ -1284,6 +1303,8 @@ def _catch_invented_column(response_text: str, prompt: str,
     """
     if not file_id or not response_text or not prompt:
         return response_text
+    if _COLUMN_CREATION_RE.search(prompt):
+        return response_text  # the column is being built, not looked up
     m = _COLUMN_ASK_RE.search(prompt)
     if not m:
         return response_text
@@ -1552,6 +1573,8 @@ TOOLS = [
     query_table_data,
     list_uploaded_files,
     export_data,
+    merge_files_side_by_side,
+    combine_columns,
     modify_export,
     get_file_overview,
     get_page_content,
@@ -1589,6 +1612,10 @@ You have these tools available:
 - modify_export: when user wants to CHANGE a file that already exists —
   add or remove the document header block above the table, rename columns,
   drop columns. Never re-export from scratch to satisfy one of these.
+- merge_files_side_by_side: to put TWO documents' columns next to each
+  other in one sheet — 'side by side', 'horizontal merge', 'SQL join style'
+- combine_columns: to join two or more columns of an ALREADY EXPORTED file
+  into one new column
 - get_file_overview: when user wants a summary of a file
 - generate_quotation: when asked to create a quotation from RFQ
 - analyze_past_contracts: for bid history, win/loss patterns, improvements
@@ -1650,6 +1677,16 @@ Rules:
 13. If a request repeats one you already answered, do NOT restate the earlier
     answer more confidently. Repetition means the last answer was wrong —
     call the tool again and report what it actually returns.
+14. HORIZONTAL MERGE: when the user says 'side by side', 'left side right
+    side', 'SQL join style', 'horizontal merge', or 'put both files next to
+    each other', use merge_files_side_by_side. NEVER use export_data for
+    this — export_data stacks rows vertically, so the second document's rows
+    land BELOW the first one's under their own separate columns, which is
+    the opposite of what was asked. Pass the output filename the user named.
+15. COLUMN COMBINE: when the user says 'combine columns', 'merge the X and
+    Y columns', 'concatenate columns', or 'create one column from', use
+    combine_columns on the output file they name — not export_data, and not
+    modify_export. Give the column names exactly as they appear in that file.
 """
 
 
@@ -2111,6 +2148,8 @@ def _tool_to_intent(tool_name: str) -> str:
         "list_uploaded_files": "list_files",
         "export_data": "export",
         "modify_export": "export",
+        "merge_files_side_by_side": "export",
+        "combine_columns": "export",
         "get_file_overview": "overview",
         "get_page_content": "page_lookup",
         "get_table_of_contents": "table_of_contents",
