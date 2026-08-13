@@ -18,6 +18,9 @@ langchain-chroma
 langchain-core
 langchain-classic
 langchain-text-splitters
+langgraph
+langgraph-checkpoint-sqlite
+tabulate
 docling
 docling-core
 sentence-transformers
@@ -26,6 +29,13 @@ sentence-transformers
 python-docx
 python-pptx
 matplotlib
+xlsxwriter
+fpdf2
+jinja2
+
+# installed ahead of use — for upcoming quotation/procurement features
+FlagEmbedding
+polars
 
 # OCR fallback
 pytesseract

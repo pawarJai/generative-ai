@@ -33,6 +33,14 @@ def extract_toc(doc) -> List[Dict[str, Any]]:
 
 
 def build_summary(file_id: str) -> None:
+    # Re-uploading identical content under a new file_id (common when a
+    # frontend re-uploads on every page load) previously re-ran this LLM
+    # call every time even though the answer can't have changed.
+    content_hash = state.FILE_META.get(file_id, {}).get("content_hash")
+    if content_hash and content_hash in state.SUMMARY_CACHE:
+        state.FILE_META[file_id]["summary"] = state.SUMMARY_CACHE[content_hash]
+        return
+
     toc = state.FILE_META.get(file_id, {}).get("toc", [])
     toc_text = "\n".join(f"- {t['text']} (p.{t['page']})" for t in toc[:60]) or "(no headings detected)"
     if state.FILE_KIND.get(file_id) == "tabular":
@@ -57,5 +65,7 @@ def build_summary(file_id: str) -> None:
             summary = ("Overview generation produced malformed output twice. "
                        f"Try re-running ingestion for '{file_id}' or check the model config.")
         state.FILE_META[file_id]["summary"] = summary
+        if content_hash and not looks_malformed(summary):
+            state.SUMMARY_CACHE[content_hash] = summary
     except Exception as e:
         state.FILE_META[file_id]["summary"] = f"(overview unavailable: {e})"

@@ -23,20 +23,48 @@ def init_db() -> None:
                 ingested_at       REAL NOT NULL
             )
         """)
+        # A document belongs to the conversation it was uploaded into, so a
+        # chat shows its own files instead of every file ever ingested.
+        # Added after the table shipped, so existing registries are migrated
+        # in place rather than rebuilt — rows from before this keep
+        # session_id NULL and belong to no conversation.
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(file_registry)")}
+        if "session_id" not in cols:
+            conn.execute("ALTER TABLE file_registry ADD COLUMN session_id TEXT")
 
 
-def register_file(file_id: str, original_filename: str, path: str, kind: str) -> None:
+def register_file(file_id: str, original_filename: str, path: str, kind: str,
+                  session_id: Optional[str] = None) -> None:
     with _conn() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO file_registry VALUES (?, ?, ?, ?, ?)",
-            (file_id, original_filename, path, kind, time.time()),
+            "INSERT OR REPLACE INTO file_registry "
+            "(file_id, original_filename, path, kind, ingested_at, session_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (file_id, original_filename, path, kind, time.time(), session_id),
         )
 
 
-def get_all_files() -> List[dict]:
+def get_all_files(session_id: Optional[str] = None) -> List[dict]:
+    """Registered files, oldest first. With a session_id, only the documents
+    uploaded into that conversation — the UI asks this way so one chat never
+    displays another chat's documents."""
     with _conn() as conn:
-        rows = conn.execute("SELECT * FROM file_registry ORDER BY ingested_at").fetchall()
+        if session_id:
+            rows = conn.execute(
+                "SELECT * FROM file_registry WHERE session_id=? ORDER BY ingested_at",
+                (session_id,)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM file_registry ORDER BY ingested_at").fetchall()
     return [dict(r) for r in rows]
+
+
+def get_file(file_id: str) -> Optional[dict]:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM file_registry WHERE file_id=?", (file_id,)
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def remove_file(file_id: str) -> None:

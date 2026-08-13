@@ -93,14 +93,98 @@
 
     .btn-solid:hover { background: var(--gray-8); }
 
-    /* ─── Control panel ─── */
-    .control-panel {
-      display: grid;
-      grid-template-columns: 220px 1fr 200px;
-      gap: 12px;
-      padding: 16px 32px;
-      border-bottom: 1px solid var(--gray-2);
+    /* ─── Sidebar ───
+       Chats live down the left, ChatGPT-style. This used to be a horizontal
+       strip above the conversation listing every document ever ingested,
+       which scrolled off-screen at 14 files and showed no chat history at
+       all. */
+    .body-row { display: flex; flex: 1; min-height: 0; }
+
+    .sidebar {
+      width: 268px;
       flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      padding: 16px;
+      border-right: 1px solid var(--gray-2);
+      overflow-y: auto;
+      background: var(--white);
+    }
+
+    .sidebar-section-title {
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--gray-6);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .chat-list { display: flex; flex-direction: column; gap: 2px; }
+
+    /* The delete control is a sibling of the chat button, not a child —
+       a <button> inside a <button> is invalid and swallows its own clicks. */
+    .chat-row { display: flex; align-items: center; }
+    .chat-row:hover { background: var(--gray-1); border-radius: var(--radius); }
+
+    .chat-del {
+      flex-shrink: 0;
+      width: 24px;
+      height: 24px;
+      margin-right: 4px;
+      border: none;
+      background: none;
+      border-radius: 4px;
+      color: var(--gray-4);
+      font-size: 15px;
+      line-height: 1;
+      cursor: pointer;
+      opacity: 0;
+      transition: opacity 0.12s, color 0.12s, background 0.12s;
+    }
+
+    .chat-row:hover .chat-del { opacity: 1; }
+    .chat-del:focus-visible { opacity: 1; }
+    .chat-del:hover { color: #991b1b; background: #fef2f2; }
+
+    .chat-item {
+      display: block;
+      flex: 1;
+      min-width: 0;
+      text-align: left;
+      padding: 8px 10px;
+      border: none;
+      border-radius: var(--radius);
+      background: none;
+      font: inherit;
+      font-size: 12.5px;
+      color: var(--gray-6);
+      cursor: pointer;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      transition: background 0.15s, color 0.15s;
+    }
+
+    .chat-item:hover { background: var(--gray-1); color: var(--black); }
+    .chat-item.active { background: var(--gray-1); color: var(--black); font-weight: 600; }
+
+    .chat-item-meta {
+      display: block;
+      font-size: 10px;
+      font-weight: 400;
+      color: var(--gray-4);
+      letter-spacing: 0.04em;
+      margin-top: 2px;
+    }
+
+    .sidebar-empty {
+      font-size: 11.5px;
+      color: var(--gray-4);
+      padding: 2px 10px 6px;
     }
 
     .panel-card {
@@ -211,10 +295,12 @@
 
     .file-chips {
       display: flex;
-      align-items: center;
-      gap: 8px;
-      overflow-x: auto;
-      min-height: 36px;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 6px;
+      max-height: 220px;
+      overflow-y: auto;
+      min-height: 20px;
     }
 
     .file-chips::-webkit-scrollbar { height: 0; }
@@ -678,8 +764,10 @@
     </div>
   </div>
 
-  <!-- Control panel -->
-  <div class="control-panel">
+  <div class="body-row">
+
+  <!-- Sidebar -->
+  <div class="sidebar">
 
     <!-- Brand card -->
     <div class="panel-card brand-card">
@@ -699,17 +787,25 @@
       </button>
     </div>
 
-    <!-- Active documents -->
+    <!-- Past chats -->
+    <div class="panel-card docs-card">
+      <div class="sidebar-section-title">Chats</div>
+      <div class="chat-list" id="chatList">
+        <div class="sidebar-empty">No past chats yet</div>
+      </div>
+    </div>
+
+    <!-- Documents in THIS chat -->
     <div class="panel-card docs-card">
       <div class="docs-header">
         <div class="docs-title">
-          Active Documents
+          Documents in this chat
           <span class="badge" id="fileCountBadge">0</span>
         </div>
-        <button class="clear-btn" onclick="clearAll()">Clear All</button>
+        <button class="clear-btn" onclick="clearAll()">Clear</button>
       </div>
       <div class="file-chips" id="fileChips">
-        <span class="no-files-text">No files uploaded</span>
+        <span class="no-files-text">No files in this chat</span>
       </div>
     </div>
 
@@ -733,7 +829,7 @@
   </div>
 
   <!-- Chat area -->
-  <div class="chat-area">
+  <div class="chat-area" style="min-width:0">
     <div class="messages" id="messages">
       <div class="empty" id="emptyState">
         <div class="empty-title">Start chatting with Onex AI</div>
@@ -756,9 +852,11 @@
           </svg>
         </button>
       </div>
-      <div class="input-hint">Onex AI can make mistakes · Verify important information</div>
+      <!-- <div class="input-hint">Onex AI can make mistakes · Verify important information</div> -->
     </div>
   </div>
+
+  </div><!-- /body-row -->
 
 </div>
 
@@ -788,7 +886,11 @@ async function handleFile(file) {
   try {
     const fd = new FormData();
     fd.append('file', file);
-    const res = await fetch(`${API}/ingest?file_id=${fileId}`, { method: 'POST', body: fd });
+    // The document is tied to the chat it was uploaded into, so this chat
+    // shows it and other chats do not.
+    const res = await fetch(
+      `${API}/ingest?file_id=${encodeURIComponent(fileId)}&session_id=${encodeURIComponent(getSessionId())}`,
+      { method: 'POST', body: fd });
     if (!res.ok) throw new Error((await res.json()).detail || 'Upload failed');
     const { job_id } = await res.json();
 
@@ -825,9 +927,117 @@ async function pollJob(jobId, intervalMs = 1500, maxWaitMs = 120000) {
   throw new Error('Ingestion timed out after 2 minutes');
 }
 
-function addFileChip(fileId) {
+/* Documents for ONE chat, from the durable registry — so a refresh (or a
+   server restart) no longer looks like "all my data is gone" and never
+   requires re-uploading, while a chat still only ever shows the files that
+   were uploaded into it. Entries whose source upload is genuinely gone from
+   disk come back as `missing` and are not offered as selectable. */
+async function loadExistingFiles() {
+  resetFileChips();
+  try {
+    const res = await fetch(`${API}/files?session_id=${encodeURIComponent(getSessionId())}`);
+    if (!res.ok) return;
+    const files = await res.json();
+    const usable = files.filter(f => f.status !== 'missing');
+    usable.forEach(f => addFileChip(f.file_id, f.status));
+    if (usable.length) {
+      selectFile(usable[usable.length - 1].file_id, { silent: true });
+      enableChat();
+    }
+  } catch (e) { /* offline backend — leave the empty state as-is */ }
+}
+
+function resetFileChips() {
+  document.getElementById('fileChips').innerHTML =
+    '<span class="no-files-text">No files in this chat</span>';
+  document.getElementById('fileCountBadge').textContent = '0';
+  fileCount = 0;
+  activeFileId = null;
+}
+
+/* ── Past chats ──
+   The sidebar lists conversations from the server's LangGraph checkpoints.
+   Nothing about a chat — its transcript or its documents — is shown until
+   the user actually opens it. */
+async function loadSessions() {
+  const list = document.getElementById('chatList');
+  try {
+    const res = await fetch(`${API}/chat/sessions`);
+    if (!res.ok) return [];
+    const sessions = await res.json();
+    const current = getSessionId();
+    if (!sessions.length) {
+      list.innerHTML = '<div class="sidebar-empty">No past chats yet</div>';
+      return [];
+    }
+    list.innerHTML = '';
+    sessions.forEach(s => {
+      const row = document.createElement('div');
+      row.className = 'chat-row';
+
+      const item = document.createElement('button');
+      item.className = `chat-item ${s.session_id === current ? 'active' : ''}`;
+      item.dataset.id = s.session_id;
+      const docs = s.file_count === 1 ? '1 doc' : `${s.file_count} docs`;
+      item.innerHTML = `${esc(s.title || 'Untitled chat')}
+        <span class="chat-item-meta">${s.message_count} messages · ${docs}</span>`;
+      item.addEventListener('click', () => openSession(s.session_id));
+
+      const del = document.createElement('button');
+      del.className = 'chat-del';
+      del.title = 'Delete this chat';
+      del.setAttribute('aria-label', `Delete chat: ${s.title || 'Untitled chat'}`);
+      del.textContent = '×';
+      del.addEventListener('click', e => {
+        e.stopPropagation();   // deleting must not also open the chat
+        deleteSession(s.session_id, s.title);
+      });
+
+      row.append(item, del);
+      list.appendChild(row);
+    });
+    return sessions;
+  } catch (e) { /* offline backend — leave the empty state as-is */ }
+  return [];
+}
+
+/* Deleting removes the conversation and its checkpointed history. The
+   documents that were uploaded into it stay on disk and in the registry —
+   deleting a chat must never delete the user's source files. */
+async function deleteSession(sessionId, title) {
+  const label = title ? `"${title}"` : 'this chat';
+  if (!confirm(`Delete ${label}?\n\nThe conversation and its history are removed. `
+             + `Documents you uploaded stay on disk.`)) return;
+  try {
+    const res = await fetch(`${API}/chat/sessions/${encodeURIComponent(sessionId)}`,
+                            { method: 'DELETE' });
+    if (!res.ok) throw new Error((await res.json()).detail || 'Delete failed');
+    showToast('Chat deleted', 'success');
+    // Deleting the chat currently on screen has to leave a usable state,
+    // not a transcript belonging to a conversation that no longer exists.
+    if (sessionId === getSessionId()) newChat();
+    await loadSessions();
+  } catch (err) {
+    showToast(err.message, 'error');
+  }
+}
+
+async function openSession(sessionId) {
+  // Re-clicking the chat already on screen is a no-op, but a session that is
+  // current-yet-unrendered (fresh tab) still needs loading.
+  if (sessionId === getSessionId() && document.querySelector('.msg-row')) return;
+  localStorage.setItem('onex_session_id', sessionId);
+  document.querySelectorAll('.chat-item').forEach(
+    c => c.classList.toggle('active', c.dataset.id === sessionId));
+  clearMessages();
+  await loadExistingFiles();   // this chat's documents, not every document
+  await restoreSession();
+}
+
+function addFileChip(fileId, status) {
   const container = document.getElementById('fileChips');
   if (container.querySelector('.no-files-text')) container.innerHTML = '';
+  if (container.querySelector(`.file-chip[data-id="${CSS.escape(fileId)}"]`)) return;
   fileCount++;
   document.getElementById('fileCountBadge').textContent = fileCount;
 
@@ -842,31 +1052,56 @@ function addFileChip(fileId) {
     </div>
     <div>
       <div class="chip-label">${esc(fileId)}</div>
-      <div class="chip-status">Active</div>
+      <div class="chip-status">${status === 'on_disk' ? 'Saved' : 'Active'}</div>
     </div>`;
   chip.addEventListener('click', () => selectFile(fileId));
   container.appendChild(chip);
 }
 
-function selectFile(fileId) {
+function selectFile(fileId, opts) {
   activeFileId = fileId;
   document.querySelectorAll('.file-chip').forEach(c => c.classList.toggle('active', c.dataset.id === fileId));
   enableChat();
+  // Restoring files on page load must not wipe the transcript the user is
+  // about to get back (Step 3) or announce a switch they did not make.
+  if (opts && opts.silent) return;
   clearMessages();
   addMsg('assistant', `Switched to **${fileId}**. What would you like to know?`);
 }
 
 function clearAll() {
-  document.getElementById('fileChips').innerHTML = '<span class="no-files-text">No files uploaded</span>';
-  document.getElementById('fileCountBadge').textContent = '0';
-  fileCount = 0;
-  activeFileId = null;
+  resetFileChips();
   clearMessages();
   document.getElementById('msgInput').disabled = true;
   document.getElementById('sendBtn').disabled = true;
 }
 
-function newChat() { clearMessages(); }
+/* ── Session identity ──
+   Every turn is checkpointed server-side under its session_id. Until now the
+   frontend never sent one, so every tab — and every "New Chat" — kept writing
+   into the single thread named "default", and New Chat only wiped the visible
+   DOM while the server thread kept growing. The id is stored so a closed tab
+   can be resumed (Step 3). */
+function newSessionId() {
+  const id = (crypto.randomUUID ? crypto.randomUUID()
+                                : String(Date.now()) + Math.random().toString(16).slice(2));
+  localStorage.setItem('onex_session_id', id);
+  return id;
+}
+function getSessionId() {
+  return localStorage.getItem('onex_session_id') || newSessionId();
+}
+
+function newChat() {
+  newSessionId();   // start a genuinely new server-side thread, not just a blank screen
+  clearMessages();
+  // A new chat starts with no documents. They belong to the chat they were
+  // uploaded into, so carrying the previous chat's files across is exactly
+  // the "why am I seeing every document" problem this replaced.
+  resetFileChips();
+  document.querySelectorAll('.chat-item').forEach(c => c.classList.remove('active'));
+  enableChat();
+}
 
 /* ── Chat ── */
 async function sendMessage() {
@@ -878,22 +1113,26 @@ async function sendMessage() {
   setInputDisabled(true);
   const tid = showTyping();
   try {
-    const fileId = activeFileId || 'general_chat';
+    // No document selected means no document — not a placeholder file_id.
+    const fileId = activeFileId || null;
     const res = await fetch(`${API}/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt: text, file_id: fileId })
+      body: JSON.stringify({ prompt: text, file_id: fileId, session_id: getSessionId() })
     });
     removeTyping(tid);
     if (!res.ok) throw new Error((await res.json()).detail || 'Query failed');
     const data = await res.json();
 
-    // Check for file names in response (e.g., *.csv, *.xlsx, *.pdf)
-    const fileMatch = data.response.match(/([a-zA-Z0-9_\-]+\.(?:csv|xlsx|pdf|docx|pptx|png|jpg|jpeg))/i);
-    const filename = fileMatch ? fileMatch[1] : null;
+    // The backend reports the file it actually wrote to outputs/ in
+    // data.filename — always prefer it. Scraping a name out of the prose
+    // used to pick up the SOURCE document (…data-file-2.pdf, which lives in
+    // uploads/, not outputs/) and produced a download link that 404'd, so
+    // the fallback is now limited to export formats only.
+    const fileMatch = data.response.match(/([a-zA-Z0-9_\-]+\.(?:csv|xlsx|docx|pptx))/i);
+    const filename = data.filename || (fileMatch ? fileMatch[1] : null);
 
     if (data.table && data.table.columns) addMsgTable('assistant', data.response, data.table, data.sql);
-    else if (data.export_file) addMsgLink('assistant', data.response, data.export_file);
     else if (filename) addMsgLink('assistant', data.response, filename);
     else addMsg('assistant', data.response);
   } catch (err) {
@@ -902,6 +1141,9 @@ async function sendMessage() {
   } finally {
     setInputDisabled(false);
     input.focus();
+    // A brand-new chat only becomes a listed conversation once it has a
+    // turn in it, so the sidebar is refreshed after each exchange.
+    loadSessions();
   }
 }
 
@@ -1042,6 +1284,37 @@ function esc(s) {
 document.getElementById('msgInput').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
 });
+
+/* Replay this browser's conversation from the server-side LangGraph
+   checkpoints, so closing the tab or refreshing no longer loses the chat. */
+async function restoreSession() {
+  const sid = localStorage.getItem('onex_session_id');
+  if (!sid) return;
+  try {
+    const res = await fetch(`${API}/chat/history/${encodeURIComponent(sid)}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    if (!data.messages || !data.messages.length) return;
+    clearMessages();
+    data.messages.forEach(m => addMsg(m.role, m.content));
+  } catch (e) { /* offline backend — keep the empty state */ }
+}
+
+(async function init() {
+  const sessions = await loadSessions();
+  const stored = localStorage.getItem('onex_session_id');
+  const known = sessions.some(s => s.session_id === stored);
+  // Land on the conversation the user was last in. Without this, a browser
+  // whose stored id belongs to a chat that was never used (or was cleared)
+  // opens a blank screen while their real history sits in the sidebar
+  // untouched.
+  if (!known && sessions.length) {
+    await openSession(sessions[0].session_id);
+    return;
+  }
+  await loadExistingFiles();
+  await restoreSession();
+})();
 </script>
 </body>
 </html>

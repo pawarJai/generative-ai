@@ -9,6 +9,18 @@ from app import state
 from app.tables.helpers import resolve_file_scope
 
 
+# Asking about the conversation, not about a document. Named because the
+# LangGraph agent needs the same question answered — a second copy of this
+# would be a second answer to "is this about the chat or about the file".
+CONVERSATION_RECALL_RE = re.compile(
+    r"\b(remind me|remind (the |last )|what did (i|you|we) (say|tell|ask|do)|"
+    r"last (chat|chats|message|messages|output|conversation|conversations|query|"
+    r"prompt|response|answer)|"
+    r"previous (chat|chats|message|messages|request|query|prompt|response|answer)|"
+    r"what (i|did i) (told|tell|said|say)|what was (my|the) last|"
+    r"recap|chat history|conversation history)\b", re.IGNORECASE)
+
+
 def extract_rename_clause(prompt: str) -> Dict[str, str]:
     out = {}
     for m in re.finditer(
@@ -56,13 +68,7 @@ def _plan_query_raw(prompt: str, fid: Optional[str]) -> QueryPlan:
 
     # Conversation-history requests — answered from session history, never
     # from the document or the data.
-    if not has_action_verb and re.search(
-        r"\b(remind me|remind (the |last )|what did (i|you|we) (say|tell|ask|do)|"
-        r"last (chat|message|output|conversation|query|prompt|response|answer)|"
-        r"previous (chat|message|request|query|prompt|response|answer)|"
-        r"what (i|did i) (told|tell|said|say)|what was (my|the) last|"
-        r"recap|chat history|conversation history)\b", p
-    ):
+    if not has_action_verb and CONVERSATION_RECALL_RE.search(p):
         return QueryPlan(intent="chat_history")
 
     # Questions about the assistant's own behaviour/errors. Searching the

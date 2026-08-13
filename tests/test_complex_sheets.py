@@ -14,7 +14,7 @@ import pytest
 import pandas as pd
 from app.ingestion.universal import universal_ingest
 from app.tables.helpers import get_all_real_tables
-from app.query.dispatch import chat
+from app.query.dispatch_legacy import chat
 
 REAL_XLSX = "uploads/data-file-5_9451_data-file-5.xlsx"
 

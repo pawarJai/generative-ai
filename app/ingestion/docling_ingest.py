@@ -24,7 +24,7 @@ def ingest_docling(path: str, file_id: str, force: bool = False,
 
     state.DOCLING_DOCS[file_id] = doc
     state.FILE_KIND[file_id] = "docling"
-    state.FILE_META[file_id] = {"toc": extract_toc(doc), "ocr_pages": []}
+    state.FILE_META[file_id] = {"toc": extract_toc(doc), "ocr_pages": [], "content_hash": h}
 
     full_text_parts = [doc.export_to_markdown()]
     page_nos = sorted({item.prov[0].page_no for item in getattr(doc, "texts", [])

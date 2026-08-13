@@ -23,7 +23,7 @@ from app import state
 from app.ingestion.universal import universal_ingest
 from app.query.code_exec import run_code_on_files, run_code_on_file
 from app.query.planner import plan_query
-from app.query.dispatch import chat, _resolve_target_files
+from app.query.dispatch_legacy import chat, _resolve_target_files
 from app.tables.helpers import get_all_real_tables, resolve_file_scope
 from app.models import QueryPlan
 

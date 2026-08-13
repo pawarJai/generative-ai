@@ -17,13 +17,22 @@ docling_cache/
 .deepeval/
 
 # Runtime state & logs
-file_registry.db
-jobs.db
+*.db
+*.db-shm
+*.db-wal
+*.db.bak-*
 interaction_log.jsonl
+
+# Backup & corrupted state directories
+chroma_bge.bak-*/
+chroma_bge.corrupt-*/
 
 # User data — ingested uploads and generated exports
 uploads/
 outputs/
+
+# Claude-generated work-in-progress documents
+PLAN-*.md
 
 # Editor / OS
 .vscode/

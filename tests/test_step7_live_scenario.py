@@ -10,7 +10,7 @@ import os
 import pytest
 
 from app.ingestion.universal import universal_ingest
-from app.query.dispatch import chat
+from app.query.dispatch_legacy import chat
 from app.tables.helpers import get_all_real_tables
 
 REAL_CSV = "uploads/data-file-3_0173_data-file-3.csv"

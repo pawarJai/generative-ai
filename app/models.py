@@ -11,7 +11,8 @@ class QueryPlan(BaseModel):
     intent: Literal[
         "qa", "page_lookup", "list_columns", "export", "complex",
         "overview", "table_of_contents", "generate", "row_sample", "data_query",
-        "chat_history", "ai_meta", "general", "list_files"
+        "chat_history", "ai_meta", "general", "list_files",
+        "generate_quotation", "contract_analysis"
     ] = Field(
         description="qa=general document Q&A via vector search; page_lookup=specific "
                     "page; list_columns=table headers/shape; export=pull EXISTING "
@@ -28,7 +29,9 @@ class QueryPlan(BaseModel):
                     "general=question with no connection to any uploaded file (general "
                     "knowledge, math, weather, casual conversation) — never touches "
                     "vector search or file state; "
-                    "list_files=meta question about which files have been uploaded."
+                    "list_files=meta question about which files have been uploaded; "
+                    "generate_quotation=build a pre-filled quotation Excel from an RFQ; "
+                    "contract_analysis=analyze past contracts/bids for win-loss patterns."
     )
     page_number: Optional[int] = None
     sink: Optional[Literal["csv", "excel", "docx", "pptx", "chart"]] = Field(
@@ -39,6 +42,11 @@ class QueryPlan(BaseModel):
     file_scope: Optional[List[str]] = None
     n_rows: Optional[int] = None
     sheet_name: Optional[str] = None
+    no_context: bool = Field(
+        False, description="Suppress the document context band (letterhead, "
+                           "section heading, provenance) that is otherwise "
+                           "written above the table. Set when the user asks "
+                           "for the bare table only.")
 
 
 class IngestResponse(BaseModel):
@@ -55,6 +63,10 @@ class FileSummary(BaseModel):
     original_filename: str
     kind: str
     summary: Optional[str] = None
+    # "loaded"  — parsed objects are in memory, usable right now
+    # "on_disk" — registered and the upload still exists; restored on first use
+    # "missing" — registered but the source upload is gone from disk
+    status: str = "loaded"
 
 
 class ChatRequest(BaseModel):
