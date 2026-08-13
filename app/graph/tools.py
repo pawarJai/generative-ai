@@ -250,7 +250,9 @@ def export_data(question: str, format: str = "excel",
                                   _deterministic_page_export,
                                   _resolve_source_specs,
                                   _deterministic_multi_export,
-                                  _side_by_side_plan)
+                                  _side_by_side_plan,
+                                  _extract_requested_sheet,
+                                  _deterministic_sheet_export)
 
     default_name = filename or f"export.{'xlsx' if format == 'excel' else format}"
 
@@ -301,6 +303,19 @@ def export_data(question: str, format: str = "excel",
     # document "does not contain a table with the exact columns" — about a
     # table that is plainly there on pages 7 to 10.
     intent_text = app_state.get_current_user_prompt() or question
+
+    # A named SHEET of a spreadsheet, matched against the file's own real
+    # sheet names first — before the sandbox ever sees a question, and
+    # before _clean_export_question can mangle one. Confirmed production
+    # failure: "export sheet name = cover sheet into sheet-01.xlsx" had its
+    # sheet name deleted by the directive-stripping regex below, because it
+    # sat between the words "export" and "file".
+    sheet_name = (_extract_requested_sheet(intent_text, target_files[0])
+                 or _extract_requested_sheet(question, target_files[0]))
+    if sheet_name:
+        return _deterministic_sheet_export(
+            target_files[0], sheet_name, default_name, format)
+
     pages = _extract_requested_pages(intent_text) or _extract_requested_pages(question)
     if pages and app_state.FILE_KIND.get(target_files[0]) == "docling":
         from app.graph.agent import _WHOLE_TABLE_RE, _wants_bare_table

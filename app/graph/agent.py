@@ -389,6 +389,111 @@ def _extract_requested_pages(prompt: str) -> list:
     return pages
 
 
+def _sheet_base_name(label) -> str:
+    """A tabular sheet's own name, stripped of the '(block N)'/'_Raw' suffix
+    app.ingestion.tabular_ingest.py adds to distinguish the several tables one
+    messy sheet gets split into. 'Cover Sheet_Raw' and 'Cover Sheet (block 2)'
+    are both the same sheet, named 'Cover Sheet'."""
+    s = str(label or "")
+    s = re.sub(r"\s*\(block \d+\)\s*$", "", s)
+    s = re.sub(r"_Raw$", "", s)
+    return s.strip()
+
+
+def _tabular_sheet_names(file_id: str) -> List[str]:
+    from app.tables.helpers import get_all_real_tables
+    seen, names = set(), []
+    for t in get_all_real_tables(file_id):
+        base = _sheet_base_name(t.attrs.get("page"))
+        if base and base not in seen:
+            seen.add(base)
+            names.append(base)
+    return names
+
+
+def _extract_requested_sheet(prompt: str, file_id: Optional[str]) -> Optional[str]:
+    """The real sheet name a prompt asks for, matched against the FILE'S OWN
+    sheet names rather than guessed from generic export phrasing.
+
+    Confirmed production failure (14:11:03): "in data-file-5 check data like
+    want to export sheet name = cover sheet in to new file sheet-01.xlsx" was
+    handed to the code-exec sandbox as the question 'in data-file-5 check
+    data like want to' — _clean_export_question's directive-stripping regex
+    matched 'export ... file' across the whole 40-character gap between them,
+    deleting 'sheet name = cover sheet' along with the phrasing it was meant
+    to strip, since the sheet name happened to sit in between. The sandbox
+    then had nothing left to answer and said so; a false-missing-file
+    cascade followed. Matching the prompt against sheets that actually exist
+    in this document can't be fooled by whatever phrasing surrounds the name,
+    the same reasoning _find_named_files already uses for filenames."""
+    if not file_id:
+        return None
+    from app import state as app_state
+    if app_state.FILE_KIND.get(file_id) != "tabular":
+        return None
+    names = _tabular_sheet_names(file_id)
+    if not names:
+        return None
+    normalized = re.sub(r"[^a-z0-9]", "", (prompt or "").lower())
+    # Longest name first: a short sheet name must not shadow-match inside a
+    # longer one that also appears in the prompt.
+    for name in sorted(names, key=len, reverse=True):
+        key = re.sub(r"[^a-z0-9]", "", name.lower())
+        if key and key in normalized:
+            return name
+    return None
+
+
+def _deterministic_sheet_export(file_id: str, sheet_name: str, out_filename: str,
+                                out_format: str) -> str:
+    """Export one named sheet of a tabular (xlsx/csv) file, read from the
+    real tables ingestion already extracted rather than re-derived by the
+    code-exec sandbox from a natural-language question — same reasoning as
+    _deterministic_page_export for docling pages, applied to sheet names
+    instead of page numbers."""
+    from app.tables.helpers import get_all_real_tables
+    from app.export.exporters import EXPORTERS, verify_export
+    from app.models import QueryPlan
+    from app import state as app_state
+    import os
+    from app.config import OUTPUT_DIR
+
+    src = _display_name(file_id, app_state.FILE_ORIGINAL_NAME.get(file_id) or file_id)
+    tables = get_all_real_tables(file_id)
+    matches = [t for t in tables
+              if _sheet_base_name(t.attrs.get("page")) == sheet_name]
+    if not matches:
+        return (f"No sheet named '{sheet_name}' was found in '{src}' — no "
+                f"file was created.")
+
+    # The _Raw table is the whole sheet — unmerged and blank-trimmed, but
+    # otherwise every cell exactly as the sheet has it. The '(block N)'
+    # tables are structured sub-tables the same sheet was split into for
+    # header detection. Asked for "the sheet" rather than a specific table
+    # within it, the Raw version is the faithful whole-sheet answer.
+    raw = [t for t in matches if str(t.attrs.get("page", "")).endswith("_Raw")]
+    picked = raw if raw else matches
+
+    if len(picked) == 1:
+        df = picked[0]
+    else:
+        from app.tables.assembly import assemble
+        df, _report = assemble(picked)
+    if df is None or df.empty:
+        return f"Sheet '{sheet_name}' in '{src}' has no rows — no file was created."
+
+    plan = QueryPlan(intent="export", sink=out_format, filename=out_filename)
+    export_fn = EXPORTERS.get(out_format, EXPORTERS["excel"])
+    export_fn(file_id, plan, tables=[df])
+
+    path = os.path.join(OUTPUT_DIR, out_filename)
+    ok, verify_msg = verify_export(path, len(df), out_format)
+    source = f" Source: '{src}' (file_id {file_id}), sheet '{sheet_name}'."
+    if not ok:
+        return f"Export attempted but verification failed: {verify_msg}{source}"
+    return f"{verify_msg}{source}"
+
+
 def _clean_export_question(prompt: str, filename: Optional[str]) -> str:
     """The raw user prompt often contains export-instruction phrasing
     ("create excel file... file name give f1-03.xlsx") alongside the
@@ -1068,6 +1173,18 @@ def _attempt_recovery_export(prompt: str, file_id: str,
     if sbs:
         from app.graph.tools import merge_sources_side_by_side
         return merge_sources_side_by_side(sbs, filename)
+
+    # A named sheet next — same reasoning as export_data's own copy of this
+    # check, and it has to be repeated here for the same reason side-by-side
+    # does: this recovery path never calls the export_data tool, so a guard
+    # placed only inside that tool does not cover it. Confirmed production
+    # failure (14:11:03): this exact path is what answered "in data-file-5
+    # ... export sheet name = cover sheet ... sheet-01.xlsx" with "the file
+    # could not be parsed... may be corrupted" for a sheet that was right
+    # there, because it fell through to the sandbox with a mangled question.
+    sheet_name = _extract_requested_sheet(prompt, file_id)
+    if sheet_name:
+        return _deterministic_sheet_export(file_id, sheet_name, filename, fmt)
 
     specs = _resolve_source_specs(prompt, file_id)
     if len(specs) > 1:

@@ -126,13 +126,19 @@ REAL_PDF_2 = "uploads/data-file-2_0060_data-file-2.pdf"
 
 @pytest.mark.skipif(not (os.path.exists(REAL_PDF_1) and os.path.exists(REAL_PDF_2)),
                     reason="real tender PDFs not available")
-def test_end_to_end_export_takes_only_the_requested_pages():
+def test_end_to_end_export_takes_only_the_requested_pages(monkeypatch):
     """The failing request, run for real against the registered documents:
     every sheet must trace back to a page the user actually named (8, plus the
     pages that table continues onto)."""
     from app import state as app_state
 
-    app_state.set_current_user_prompt(PROMPT)
+    # set_current_user_prompt() writes a module-level global with no built-in
+    # reset. Called directly (as this did before), it leaked PROMPT into
+    # every test that ran afterward in the same session — confirmed live:
+    # tests/test_sheet_export.py, added later, inherited this PROMPT instead
+    # of its own and resolved to data-file-1/data-file-2 instead of the
+    # tabular file it was actually testing. monkeypatch reverts automatically.
+    monkeypatch.setattr(app_state, "CURRENT_USER_PROMPT", PROMPT)
     specs = A._resolve_source_specs(PROMPT, None)
     if len(specs) != 2:
         pytest.skip("data-file-1 / data-file-2 are not in the file registry")
