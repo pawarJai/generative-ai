@@ -99,8 +99,8 @@ def test_padding_of_the_shorter_side_is_stated(outdir, two_docs):
     """A merge of unequal tables leaves blank cells. Saying "4 rows x 5
     columns" and stopping would let a half-empty file read as a complete one."""
     out = _invoke(file1_id="fid1", file2_id="fid2", output_filename="m.xlsx")
-    assert "Row counts differ (4 vs 2)" in out
-    assert "blank on the 'data-file-2.pdf' side" in out
+    assert "unequal length" in out
+    assert "'data-file-2.pdf' (2 rows)" in out
     assert "matched by position" in out
 
 
@@ -112,6 +112,93 @@ def test_equal_length_merge_says_nothing_about_padding(outdir, two_docs,
         else two_docs["fid1"][0].copy().pipe(lambda d: (d, None, [8]))))
     out = _invoke(file1_id="fid1", file2_id="fid2", output_filename="m.xlsx")
     assert "Row counts differ" not in out
+
+
+# --- three and four sources ------------------------------------------------
+
+@pytest.fixture
+def four_docs(monkeypatch):
+    frames = {
+        f"fid{i}": pd.DataFrame({f"Col{i}A": [1, 2, 3], f"Col{i}B": ["x", "y", "z"]})
+        for i in range(1, 5)
+    }
+    monkeypatch.setattr(T, "_side_frame", lambda fid, pages: (
+        (frames[fid].copy(), None, list(pages) if pages else [1])
+        if fid in frames else (None, "no extractable tables", [])))
+    monkeypatch.setattr(T, "_source_display_name",
+                        lambda fid: f"data-file-{fid[-1]}.pdf")
+    from app import state as app_state
+    monkeypatch.setattr(app_state, "WRITTEN_EXPORTS", {})
+    monkeypatch.setattr(app_state, "CURRENT_USER_PROMPT", None)
+    return frames
+
+
+def test_three_sources_merge_side_by_side(outdir, four_docs):
+    out = T.merge_sources_side_by_side(
+        [{"file_id": "fid1", "pages": [8]}, {"file_id": "fid2", "pages": [6]},
+         {"file_id": "fid3", "pages": [2]}], "three.xlsx")
+    assert "from 3 documents" in out
+    df = pd.read_excel(outdir / "three.xlsx")
+    assert df.shape == (3, 6)
+    assert list(df.columns) == ["Col1A_f1", "Col1B_f1", "Col2A_f2", "Col2B_f2",
+                                "Col3A_f3", "Col3B_f3"]
+
+
+def test_four_sources_merge_side_by_side(outdir, four_docs):
+    out = T.merge_sources_side_by_side(
+        [{"file_id": f"fid{i}", "pages": None} for i in range(1, 5)],
+        "four.xlsx")
+    df = pd.read_excel(outdir / "four.xlsx")
+    assert df.shape == (3, 8)
+    assert "Middle 1" in out and "Middle 2" in out  # every source is placed
+
+
+def test_extra_sources_reaches_the_tool(outdir, four_docs):
+    """The model is given file1/file2 plus extra_sources for a third and
+    fourth document — a request for four files must not silently become two."""
+    T.merge_files_side_by_side.invoke({
+        "file1_id": "fid1", "file2_id": "fid2",
+        "extra_sources": [{"file_id": "fid3", "pages": [2]},
+                          {"file_id": "fid4"}],
+        "output_filename": "extra.xlsx"})
+    assert pd.read_excel(outdir / "extra.xlsx").shape == (3, 8)
+
+
+def test_the_same_document_under_two_file_ids_is_used_once(outdir, four_docs,
+                                                            monkeypatch):
+    """Live failure: a three-document request produced five blocks — f1-a and
+    f1-b were one document beside itself, because the model named one upload
+    of data-file-1.pdf and the prompt resolver named another. One upload per
+    ingestion means two ids for one document is the normal case, not an edge
+    case."""
+    monkeypatch.setattr(T, "_source_display_name",
+                        lambda fid: {"fid1": "data-file-1.pdf",
+                                     "dup1": "data-file-1.pdf",
+                                     "fid2": "data-file-2.pdf"}.get(fid, fid))
+    monkeypatch.setattr(T, "_side_frame", lambda fid, pages: (
+        four_docs["fid1"].copy() if fid in ("fid1", "dup1")
+        else four_docs["fid2"].copy(), None, list(pages or [1])))
+    out = T.merge_sources_side_by_side(
+        [{"file_id": "fid1", "pages": None},
+         {"file_id": "dup1", "pages": [8, 9]},
+         {"file_id": "fid2", "pages": [6]}], "dup.xlsx")
+    assert "from 2 documents" in out
+    cols = list(pd.read_excel(outdir / "dup.xlsx").columns)
+    assert not [c for c in cols if c.endswith("-a") or c.endswith("-b")]
+    assert len(cols) == len(set(cols)) == 4
+
+
+def test_a_source_the_model_forgot_is_recovered_from_the_prompt(outdir,
+                                                                four_docs,
+                                                                monkeypatch):
+    """The model routinely names two files when the user named three."""
+    monkeypatch.setattr(A, "_resolve_source_specs", lambda p, f: [
+        {"file_id": "fid1", "pos": 0, "pages": [8]},
+        {"file_id": "fid2", "pos": 20, "pages": [6]},
+        {"file_id": "fid3", "pos": 40, "pages": [2]}])
+    T.merge_files_side_by_side.invoke({
+        "file1_id": "fid1", "file2_id": "fid2", "output_filename": "recov.xlsx"})
+    assert pd.read_excel(outdir / "recov.xlsx").shape == (3, 6)
 
 
 # --- provenance and the context band --------------------------------------
@@ -144,13 +231,13 @@ def test_one_document_is_refused_not_guessed(outdir, two_docs):
     """FILE_ORDER[0]/[-1] is exactly the fallback that exported a document
     nobody had mentioned. With one file named, this asks instead."""
     out = _invoke(file1_id="fid1", output_filename="m.xlsx")
-    assert "needs TWO different documents" in out
+    assert "at least TWO different documents" in out
     assert not list(outdir.glob("*.xlsx"))
 
 
 def test_same_document_twice_is_refused(outdir, two_docs):
     out = _invoke(file1_id="fid1", file2_id="fid1", output_filename="m.xlsx")
-    assert "needs TWO different documents" in out
+    assert "at least TWO different documents" in out
 
 
 def test_unreadable_side_creates_no_file(outdir, two_docs):
@@ -218,15 +305,18 @@ def test_suffix_comes_from_the_files_own_name(name, expected):
 
 
 def test_colliding_suffixes_are_separated(outdir, two_docs, monkeypatch):
-    """Two documents that reduce to the same tag would produce duplicate
-    column names and an unreadable file."""
-    monkeypatch.setattr("app.graph.agent._display_name",
-                        lambda fid, stored: "rfq-1.pdf")
+    """Two DIFFERENT documents whose names reduce to the same tag — 'rfq-1'
+    and 'tender-1' both give f1 — would produce duplicate column names and an
+    unreadable file. (Two uploads of the SAME filename are a different case:
+    they are one document, and are deduplicated instead.)"""
+    monkeypatch.setattr(T, "_source_display_name",
+                        lambda fid: {"fid1": "rfq-1.pdf",
+                                     "fid2": "tender-1.pdf"}[fid])
     _invoke(file1_id="fid1", file2_id="fid2", output_filename="m.xlsx")
     cols = list(pd.read_excel(outdir / "m.xlsx").columns)
     assert len(cols) == len(set(cols))
-    assert any(c.endswith("_f1-l") for c in cols)
-    assert any(c.endswith("_f1-r") for c in cols)
+    assert any(c.endswith("_f1-a") for c in cols)
+    assert any(c.endswith("_f1-b") for c in cols)
 
 
 # --- combine_columns -------------------------------------------------------
@@ -342,6 +432,26 @@ def test_combine_source_is_confined_to_outputs(outdir, sheet):
 
 # --- registration ----------------------------------------------------------
 
+def test_no_pages_takes_the_main_table_not_every_table(monkeypatch):
+    """"both files, next to each other" with no page numbers assembled all 49
+    tables of a document into 393 rows of mostly-empty columns. The document's
+    main table is the largest group of tables sharing a column signature."""
+    main = [pd.DataFrame({"SL no": [1, 2], "Item": ["a", "b"]}),
+            pd.DataFrame({"SL no": [3, 4], "Item": ["c", "d"]})]
+    stray = pd.DataFrame({"Enquiry No.": ["X"], "Enquiry Date": ["Y"]})
+    for i, t in enumerate(main):
+        t.attrs["page"] = 8 + i
+    stray.attrs["page"] = 1
+    monkeypatch.setattr("app.tables.helpers.get_all_real_tables",
+                        lambda fid, **kw: main + [stray])
+    monkeypatch.setattr("app.graph.agent._restore_file_if_needed",
+                        lambda fid: None)
+    df, err, used = T._side_frame("fid1", None)
+    assert err is None
+    assert list(df.columns) == ["SL no", "Item"]
+    assert len(df) == 4 and used == [8, 9]
+
+
 def test_both_tools_are_registered():
     names = {t.name for t in A.TOOLS}
     assert {"merge_files_side_by_side", "combine_columns"} <= names
@@ -356,7 +466,160 @@ def test_both_tools_count_as_exports():
     assert A._tool_to_intent("combine_columns") == "export"
 
 
+# --- routing: a side-by-side request must never reach export_data ---------
+
+# The prompt from session 477b296a (12:40:28), which said SIDE BY SIDE four
+# times, drew the wrong and the right layout row by row, and still produced a
+# 202-row 3-sheet vertical stack.
+MRG03_PROMPT = (
+    "I have two uploaded files. I need you to create a new Excel file called "
+    "mrg-03.xlsx by placing both files SIDE BY SIDE — like two tables sitting "
+    "next to each other on the same spreadsheet. FILE 1 (data-file-1): use "
+    "pages 8, 9, and 10 FILE 2 (data-file-2): use pages 6, 7, 8, 9, and 10 "
+    "THIS IS WRONG (do not do this): Row 1: file-1 record 1 Row 65: file-2 "
+    "record 1 ← stacking on top of each other is WRONG. COLUMN NAMING: Add "
+    "_file1 after every column name from data-file-1")
+
+
+@pytest.mark.parametrize("phrase", [
+    "merge data file 1 and data file 2 side by side save as x.xlsx",
+    "put data file 1 and data file 2 side-by-side into x.xlsx",
+    "horizontal merge of data file 1 and data file 2",
+    "data file 1 on the left side and data file 2 on the right side",
+    "SQL join style: data file 1 with data file 2",
+    "take both files and put them next to each other in x.xlsx",
+    "merge both data file 1 and data file 2 into x.xlsx",
+    MRG03_PROMPT,
+])
+def test_side_by_side_wording_is_detected(phrase, monkeypatch):
+    monkeypatch.setattr(A, "_resolve_source_specs", lambda p, f: [
+        {"file_id": "fid1", "pos": 0, "pages": [8, 9, 10]},
+        {"file_id": "fid2", "pos": 50, "pages": [6, 7]}])
+    assert A._side_by_side_plan(phrase, None) is not None
+
+
+@pytest.mark.parametrize("phrase", [
+    "export data file 1 page 8 9 10 into excel file x.xlsx",
+    "combine the tables from all my documents into x.xlsx",
+    "export data data-file-1 and data-file-2 tables into excel file f1-2f.xlsx",
+])
+def test_ordinary_exports_are_left_alone(phrase, monkeypatch):
+    """The vertical multi-document export is a deliberate, tested feature.
+    Only directional wording may divert a request away from it."""
+    monkeypatch.setattr(A, "_resolve_source_specs", lambda p, f: [
+        {"file_id": "fid1", "pos": 0, "pages": []},
+        {"file_id": "fid2", "pos": 50, "pages": []}])
+    assert A._side_by_side_plan(phrase, None) is None
+
+
+def test_side_by_side_with_only_one_document_is_not_a_merge(monkeypatch):
+    monkeypatch.setattr(A, "_resolve_source_specs", lambda p, f: [])
+    assert A._side_by_side_plan("put it side by side", None) is None
+
+
+def test_export_data_delegates_a_side_by_side_request(outdir, two_docs,
+                                                      monkeypatch):
+    """The unbypassable half of the fix. Whatever route reaches export_data —
+    the model choosing it, or the unverified-claim backstop re-invoking it —
+    a side-by-side request comes out horizontal."""
+    from app import state as app_state
+    monkeypatch.setattr(app_state, "CURRENT_USER_PROMPT", MRG03_PROMPT)
+    monkeypatch.setattr(A, "_resolve_source_specs", lambda p, f: [
+        {"file_id": "fid1", "pos": 0, "pages": [8, 9, 10]},
+        {"file_id": "fid2", "pos": 50, "pages": [6, 7]}])
+    called = []
+    monkeypatch.setattr(A, "_deterministic_multi_export",
+                        lambda *a, **k: called.append("vertical") or "stacked")
+
+    out = T.export_data.invoke({"question": "merge both files",
+                                "format": "excel",
+                                "filename": "mrg-03.xlsx"})
+    assert called == [], "export_data still stacked a side-by-side request"
+    assert "Horizontal" in out or "Verified" in out
+    df = pd.read_excel(outdir / "mrg-03.xlsx")
+    assert df.shape[1] > df.shape[0] or df.shape == (4, 5)
+
+
+def test_the_recovery_backstop_does_not_stack_a_side_by_side_request(
+        outdir, two_docs, monkeypatch):
+    """THE bug that survived the first fix. _run_export_now has its own copy
+    of the multi-document dispatch and never calls the export_data tool, so
+    the guard living inside export_data did not cover it. Confirmed live at
+    13:12:57 and 13:18:50: whenever the model claimed a file without creating
+    one, this path recovered the turn and stacked it into 256 rows."""
+    monkeypatch.setattr(A, "_resolve_source_specs", lambda p, f: [
+        {"file_id": "fid1", "pos": 0, "pages": [8, 9, 10]},
+        {"file_id": "fid2", "pos": 50, "pages": [6, 7]}])
+    stacked = []
+    monkeypatch.setattr(A, "_deterministic_multi_export",
+                        lambda *a, **k: stacked.append(1) or "stacked")
+
+    out = A._attempt_recovery_export(
+        "marge concat data-file-1 page 8,9,10 and data-file-2 page 6,7 into "
+        "mrg-03.xlsx makre sure marge horzontaly not verticaly like sql join",
+        "fid1")
+    assert stacked == [], "the recovery path still stacked a horizontal merge"
+    assert "side by side" in out.lower() or "Verified" in out
+    assert pd.read_excel(outdir / "mrg-03.xlsx").shape == (4, 5)
+
+
+@pytest.mark.parametrize("phrase", [
+    "makre sure marge horzontaly not verticaly",   # the exact live spelling
+    "merge them horizantal please",
+    "join it horizontaly",
+    "not verticaly please",
+    "like this live we do in sql join",
+])
+def test_misspelled_horizontal_still_routes(phrase, monkeypatch):
+    """A user who has asked four times will not be saved by a regex that
+    requires them to spell it correctly on the fifth."""
+    monkeypatch.setattr(A, "_resolve_source_specs", lambda p, f: [
+        {"file_id": "fid1", "pos": 0, "pages": []},
+        {"file_id": "fid2", "pos": 9, "pages": []}])
+    assert A._side_by_side_plan(f"data-file-1 and data-file-2 {phrase}",
+                                None) is not None
+
+
+def test_run_agent_orders_the_merge_tool_not_export_data(monkeypatch):
+    """The actual root cause: a per-turn system message read "Call export_data
+    FIRST" for any filename + export verb, and no system-prompt rule can
+    outrank an imperative injected into the same turn."""
+    monkeypatch.setattr(A, "_resolve_source_specs", lambda p, f: [
+        {"file_id": "fid1", "pos": 0, "pages": [8, 9, 10]},
+        {"file_id": "fid2", "pos": 50, "pages": [6, 7]}])
+    monkeypatch.setattr(A, "_display_name", lambda fid, stored: fid)
+    captured = {}
+
+    def fake_invoke(payload, config=None):
+        captured["messages"] = payload["messages"]
+        raise RuntimeError("stop here — only the injected messages matter")
+
+    monkeypatch.setattr(A.agent, "invoke", fake_invoke)
+    monkeypatch.setattr(A, "_restore_file_if_needed", lambda fid: None)
+    try:
+        A.run_agent(MRG03_PROMPT, session_id="routing-test", file_id=None)
+    except Exception:
+        pass
+
+    systems = " ".join(m["content"] for m in captured.get("messages", [])
+                       if m.get("role") == "system")
+    assert "merge_files_side_by_side" in systems
+    assert "Call export_data FIRST" not in systems
+    assert "Do NOT call export_data" in systems
+
+
 # --- the invented-column guard must not fire on a column being created ----
+
+def test_no_invented_column_banner_for_a_preposition(monkeypatch):
+    """'Add _file1 after every column name from data-file-1' captured `from`
+    as the column, and the merge answer was told to disregard itself."""
+    monkeypatch.setattr(A, "_header_only_column_names", lambda fid: set())
+    from app import state as app_state
+    monkeypatch.setitem(app_state.FILE_KIND, "fid1", "docling")
+    out = A._catch_invented_column("Merged.", MRG03_PROMPT, "fid1")
+    assert out == "Merged."
+
+
 
 @pytest.mark.parametrize("prompt", [
     # The live turn that produced the false banner.

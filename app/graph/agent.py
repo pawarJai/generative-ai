@@ -210,6 +210,42 @@ _EXPORT_DIRECTIVE_RE = re.compile(
 )
 _EXT_TO_FORMAT = {"xlsx": "excel", "csv": "csv", "docx": "docx", "pptx": "pptx", "pdf": "excel"}
 
+# Asking for two documents BESIDE each other rather than stacked.
+# The spelling here is deliberately loose. The turn that failed twice wrote
+# "makre sure marge horzontaly not verticaly" — a strict \bhorizontal\b misses
+# that, and a user who has asked four times is not going to be saved by a
+# regex that needs them to type it correctly on the fifth.
+_SIDE_BY_SIDE_RE = re.compile(
+    r"\bside[\s-]*by[\s-]*side\b"
+    r"|\bhor[i]?z[oa]nt"                      # horizontal, horzontaly, horizantal
+    r"|\bnot\s+vert[ie]c"                     # "not verticaly"
+    r"|\b(?:left|right)[\s-]*side\b"
+    r"|\bsql\s+(?:style\s+)?join\b"
+    r"|\bjoin\s+(?:style|like\s+sql)\b"
+    r"|\bnext\s+to\s+(?:each\s+other|one\s+another|it)\b"
+    r"|\bbeside\s+(?:each\s+other|the\s+other)\b"
+    r"|\b(?:merge|marge|concat)\s+both\b",
+    re.IGNORECASE)
+
+
+def _side_by_side_plan(prompt: str, file_id: Optional[str]) -> Optional[List[dict]]:
+    """The two documents a horizontal merge should draw from, or None when
+    this is not a horizontal merge request.
+
+    Confirmed production failure (12:40:28, session 477b296a): a prompt that
+    said SIDE BY SIDE four times, drew the wrong and right layouts row by row,
+    and ended "must NOT have double the rows" produced a 202-row, 3-sheet
+    vertical stack. Nothing about the model's reasoning was consulted — the
+    turn had already been handed a system message reading "Call export_data
+    FIRST", because a filename plus an export verb was the only thing that
+    block looked at. Rewording the system prompt cannot outrank a per-turn
+    instruction; the routing itself has to know the difference.
+    """
+    if not _SIDE_BY_SIDE_RE.search(prompt or ""):
+        return None
+    specs = _resolve_source_specs(prompt, file_id)
+    return specs if len(specs) >= 2 else None
+
 
 def _extract_requested_filename(prompt: str) -> Optional[str]:
     m = _FULL_FILENAME_RE.search(prompt)
@@ -1021,6 +1057,18 @@ def _attempt_recovery_export(prompt: str, file_id: str,
     ext = filename.rsplit(".", 1)[-1].lower()
     fmt = _EXT_TO_FORMAT.get(ext, "excel")
 
+    # Side by side FIRST. This recovery path has its own copy of the
+    # multi-document dispatch and never goes through the export_data tool, so
+    # the horizontal-merge guard living there did not cover it — confirmed at
+    # 13:12:57 and again at 13:18:50, where a prompt saying "marge horzontaly
+    # not verticaly ... like we do in sql join" was routed correctly when the
+    # model called a tool, and stacked into 256 rows whenever the model
+    # claimed a file without creating one and this backstop recovered it.
+    sbs = _side_by_side_plan(prompt, file_id)
+    if sbs:
+        from app.graph.tools import merge_sources_side_by_side
+        return merge_sources_side_by_side(sbs, filename)
+
     specs = _resolve_source_specs(prompt, file_id)
     if len(specs) > 1:
         return _deterministic_multi_export(specs, prompt, filename, fmt)
@@ -1274,9 +1322,18 @@ _COLUMN_CREATION_RE = re.compile(
     r"|\bcolumns?\s+(?:called|named)\s",
     re.IGNORECASE)
 
-# Words that are part of the request, never the name of a column.
+# Words that are part of the request, never the name of a column. The
+# function words matter as much as the obvious ones: "Add _file1 after every
+# column name from data-file-1" captured `from` as the column being asked
+# about, and the answer was told to disregard itself because the document has
+# no column called "from".
 _NOT_A_COLUMN = {"values", "value", "data", "name", "names", "header",
-                 "headers", "unique", "all", "the", "this", "that", "list"}
+                 "headers", "unique", "all", "the", "this", "that", "list",
+                 "from", "for", "with", "and", "into", "onto", "each",
+                 "every", "one", "two", "both", "new", "same", "other",
+                 "next", "after", "before", "above", "below", "left",
+                 "right", "side", "row", "rows", "file", "files", "it",
+                 "them", "any", "some", "such"}
 
 
 def _norm_col(name: str) -> str:
@@ -1677,16 +1734,30 @@ Rules:
 13. If a request repeats one you already answered, do NOT restate the earlier
     answer more confidently. Repetition means the last answer was wrong —
     call the tool again and report what it actually returns.
-14. HORIZONTAL MERGE: when the user says 'side by side', 'left side right
-    side', 'SQL join style', 'horizontal merge', or 'put both files next to
-    each other', use merge_files_side_by_side. NEVER use export_data for
-    this — export_data stacks rows vertically, so the second document's rows
-    land BELOW the first one's under their own separate columns, which is
-    the opposite of what was asked. Pass the output filename the user named.
-15. COLUMN COMBINE: when the user says 'combine columns', 'merge the X and
+14. COLUMN COMBINE: when the user says 'combine columns', 'merge the X and
     Y columns', 'concatenate columns', or 'create one column from', use
     combine_columns on the output file they name — not export_data, and not
     modify_export. Give the column names exactly as they appear in that file.
+
+TOOL SELECTION RULES — follow these exactly:
+
+export_data: ONLY for exports that STACK rows — one file, or several files
+whose rows go one under another. Examples: "export page 8 to excel",
+"save the working sheet", "create excel from data file 2".
+
+merge_files_side_by_side: use when the user says ANY of: "side by side",
+"side-by-side", "left side", "right side", "horizontal", "SQL join",
+"merge both", "next to each other", "beside each other" — or describes one
+file's columns on the left and another file's on the right.
+
+NEVER use export_data when the user says "side by side" or "horizontal", or
+otherwise asks for two documents beside each other. export_data puts the
+second document's rows BELOW the first one's, under their own separate
+columns. A side-by-side result has MORE columns than either source file and
+the SAME number of rows as the longer one — never double the rows.
+
+If a system message this turn names a tool to call, call that tool. It was
+chosen from the user's own words before you saw them.
 """
 
 
@@ -2013,7 +2084,44 @@ def run_agent(prompt: str, session_id: str = "default",
     app_state.set_band_preference(session_id,
                                   parse_instruction(prompt).get("context"))
     fallback_filename = requested_name or app_state.get_last_requested_export(session_id)
-    if requested_name and _EXPORT_DIRECTIVE_RE.search(prompt):
+    # Which tool this turn needs, decided here rather than left to the model.
+    # A side-by-side request reaching the export_data instruction below is the
+    # whole bug: that instruction is imperative and per-turn, so it beat every
+    # rule in the system prompt telling the model to merge horizontally.
+    sbs_specs = _side_by_side_plan(prompt, file_id)
+    if sbs_specs:
+        left, right = sbs_specs[0], sbs_specs[1]
+        listing = "; ".join(
+            f"{i + 1}. {_display_name(s['file_id'], app_state.FILE_ORIGINAL_NAME.get(s['file_id']) or s['file_id'])}"
+            f" (file_id={s['file_id']!r}, pages={s['pages'] or None})"
+            for i, s in enumerate(sbs_specs))
+        extra = [{"file_id": s["file_id"], "pages": s["pages"] or None}
+                 for s in sbs_specs[2:]]
+        messages.append({
+            "role": "system",
+            "content": (
+                f"MANDATORY: this message asks for {len(sbs_specs)} documents "
+                f"SIDE BY SIDE — each document's columns to the RIGHT of the "
+                f"previous one, all on the same rows. Call "
+                f"merge_files_side_by_side as your first and only tool, with "
+                f"file1_id={left['file_id']!r}, "
+                f"file1_pages={left['pages'] or None}, "
+                f"file2_id={right['file_id']!r}, "
+                f"file2_pages={right['pages'] or None}"
+                + (f", extra_sources={extra!r}" if extra else "")
+                + (f", output_filename={requested_name!r}"
+                   if requested_name else "")
+                + f". In order: {listing}. "
+                "Do NOT call export_data — it stacks rows vertically, which "
+                "puts the later documents BELOW the first instead of beside "
+                "it, and is the opposite of what was asked. Do NOT call "
+                "query_table_data or get_page_content first. Ignore how "
+                "similar requests were answered earlier in this conversation "
+                "— those answers were wrong, which is why this instruction is "
+                "here."
+            )
+        })
+    elif requested_name and _EXPORT_DIRECTIVE_RE.search(prompt):
         ext = requested_name.rsplit(".", 1)[-1].lower()
         # A request that draws on two documents is where the model is most
         # tempted to work file-by-file — read one, describe it, ask whether

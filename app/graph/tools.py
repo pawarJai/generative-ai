@@ -249,9 +249,20 @@ def export_data(question: str, format: str = "excel",
     from app.graph.agent import (_extract_requested_pages,
                                   _deterministic_page_export,
                                   _resolve_source_specs,
-                                  _deterministic_multi_export)
+                                  _deterministic_multi_export,
+                                  _side_by_side_plan)
 
     default_name = filename or f"export.{'xlsx' if format == 'excel' else format}"
+
+    # A side-by-side request must never be answered by stacking, whichever
+    # route reached this tool. The model choosing export_data is only one of
+    # them: the unverified-claim backstop re-invokes export_data directly, so
+    # a rule aimed at the model would not have covered the recovery path that
+    # actually wrote the 202-row vertical file in session 477b296a.
+    spoken = app_state.get_current_user_prompt() or question
+    sbs = _side_by_side_plan(spoken, file_id)
+    if sbs:
+        return merge_sources_side_by_side(sbs, default_name)
 
     # Multi-document FIRST. "Combine the tables from all my documents" names
     # no single file on purpose, so resolving a single target before this
@@ -359,79 +370,100 @@ def _side_frame(file_id: str, pages: Optional[list]):
     tables = get_all_real_tables(file_id)
     if not tables:
         return None, "no extractable tables", []
-    df, _report = assemble(tables)
+    # With no pages named, "this document" means its main table — not every
+    # table it contains. Assembling all 49 tables of data-file-1 gave 393
+    # rows across columns that mostly do not co-occur, which is the sparse
+    # union _group_by_schema was written to prevent. The largest group of
+    # tables sharing a column signature IS the document's main table, split
+    # across page breaks.
+    from app.graph.agent import _group_by_schema
+    groups, _skipped = _group_by_schema(tables)
+    picked = groups[0][0] if groups else tables
+    df, _report = assemble(picked)
     if df is None:
         return None, "no extractable tables", []
-    used = sorted({t.attrs.get("page") for t in tables
+    used = sorted({t.attrs.get("page") for t in picked
                    if isinstance(t.attrs.get("page"), int)})
     return df, None, used
 
 
-@tool
-def merge_files_side_by_side(
-    description: str = "",
-    file1_id: str = None,
-    file1_pages: list = None,
-    file2_id: str = None,
-    file2_pages: list = None,
-    output_filename: str = "merged.xlsx",
-) -> str:
-    """Merge data from two files SIDE BY SIDE — left columns from file 1,
-    right columns from file 2. Like a SQL JOIN but without a key column.
-    Row 1 of file1 sits next to Row 1 of file2 in the same spreadsheet row.
+def _source_display_name(file_id: str) -> str:
+    """What to call a source document. In-memory names are lost on a reload;
+    the registry keeps them. Without the fallback a merge reported "5 columns
+    from sbs-f2" — a raw file_id where the user expects a filename."""
+    from app.graph.agent import _display_name
+    from app.persistence import get_file
+    stored = (app_state.FILE_ORIGINAL_NAME.get(file_id)
+              or (get_file(file_id) or {}).get("original_filename") or file_id)
+    return _display_name(file_id, stored)
 
-    Use when the user says: 'side by side', 'horizontal merge', 'left side
-    right side', 'SQL join style', 'put both tables next to each other'.
 
-    DO NOT use this for stacking rows on top of each other — that is
-    export_data.
+def _distinct_suffixes(names: list) -> list:
+    """One short, unique tag per source document, in order.
 
-    Args:
-        description: What data to take from each file
-        file1_id: First file's file_id (left side)
-        file1_pages: Page numbers to use from file 1 (e.g. [8,9,10])
-        file2_id: Second file's file_id (right side)
-        file2_pages: Page numbers to use from file 2 (e.g. [6,7,8,9,10])
-        output_filename: Output file name (must end in .xlsx)
+    Two documents whose names reduce to the same tag would produce duplicate
+    column names and an unreadable file, so collisions get a positional
+    letter — which also scales past two sources.
     """
-    from app.graph.agent import _resolve_source_specs, _display_name
+    suffixes = [_merge_suffix(n) for n in names]
+    seen = {}
+    for i, sfx in enumerate(suffixes):
+        seen.setdefault(sfx, []).append(i)
+    for sfx, positions in seen.items():
+        if len(positions) > 1:
+            for rank, i in enumerate(positions):
+                suffixes[i] = f"{sfx}-{chr(ord('a') + rank)}"
+    return suffixes
+
+
+def merge_sources_side_by_side(specs: list, output_filename: str) -> str:
+    """Put N source documents beside each other in one sheet.
+
+    `specs` is [{"file_id": ..., "pages": [...]}, ...] in left-to-right order.
+    Two sources is the common case; three and four work the same way, because
+    the columns of each document are simply appended to the right of the last.
+    Row 1 of every source lands on spreadsheet row 1.
+    """
     from app.export.exporters import verify_export
     from app.config import OUTPUT_DIR
     import pandas as pd
 
-    # Which documents, and which of their pages, comes from the USER's own
-    # words — the same resolver export_data uses. The model's paraphrase drops
-    # page numbers, and picking FILE_ORDER[0]/[-1] instead is the confirmed
-    # worst bug in this project: it reads whichever documents the process
-    # happens to have loaded, not the ones this chat is about.
-    intent_text = app_state.get_current_user_prompt() or description or ""
-    specs = _resolve_source_specs(intent_text, None)
-    if not file1_id and len(specs) >= 2:
-        file1_id, file1_pages = specs[0]["file_id"], file1_pages or specs[0]["pages"]
-    if not file2_id and len(specs) >= 2:
-        file2_id, file2_pages = specs[1]["file_id"], file2_pages or specs[1]["pages"]
+    specs = [s for s in specs if s.get("file_id")]
+    # Same document twice contributes nothing a single copy would not — and
+    # the same document arrives under two different file_ids routinely,
+    # because one upload of "data-file-1.pdf" is registered per ingestion and
+    # the model names a different one than the prompt resolver does. Keyed on
+    # file_id alone, a three-document request came out with five blocks:
+    # f1-a and f1-b were one document, pasted beside itself.
+    by_document, order = {}, []
+    for spec in specs:
+        key = _source_display_name(spec["file_id"])
+        if key not in by_document:
+            by_document[key] = dict(spec)
+            order.append(key)
+        elif not by_document[key].get("pages") and spec.get("pages"):
+            # Whichever copy carries page numbers is the informative one.
+            by_document[key] = dict(spec)
+    specs = [by_document[k] for k in order]
 
-    if not file1_id or not file2_id or file1_id == file2_id:
+    if len(specs) < 2:
         loaded = ", ".join(
-            f"{app_state.FILE_ORIGINAL_NAME.get(f, f)} (id={f})"
+            f"{_source_display_name(f)} (id={f})"
             for f in app_state.FILE_ORDER) or "none"
-        return ("A side-by-side merge needs TWO different documents, and the "
-                "request does not say which two. Ask the user to name them. "
-                f"Loaded in this session: {loaded}.")
+        return ("A side-by-side merge needs at least TWO different documents, "
+                "and the request does not say which ones. Ask the user to name "
+                f"them. Loaded in this session: {loaded}.")
 
-    name1 = _display_name(file1_id, app_state.FILE_ORIGINAL_NAME.get(file1_id) or file1_id)
-    name2 = _display_name(file2_id, app_state.FILE_ORIGINAL_NAME.get(file2_id) or file2_id)
+    names = [_source_display_name(s["file_id"]) for s in specs]
+    frames, used_pages = [], []
+    for spec, name in zip(specs, names):
+        df, err, used = _side_frame(spec["file_id"], spec.get("pages") or None)
+        if err:
+            return f"Nothing to merge: '{name}' — {err}. No file was created."
+        frames.append(df)
+        used_pages.append(used)
 
-    df1, err1, used1 = _side_frame(file1_id, file1_pages)
-    if err1:
-        return f"Nothing to merge: '{name1}' — {err1}. No file was created."
-    df2, err2, used2 = _side_frame(file2_id, file2_pages)
-    if err2:
-        return f"Nothing to merge: '{name2}' — {err2}. No file was created."
-
-    sfx1, sfx2 = _merge_suffix(name1), _merge_suffix(name2)
-    if sfx1 == sfx2:
-        sfx1, sfx2 = f"{sfx1}-l", f"{sfx2}-r"
+    suffixes = _distinct_suffixes(names)
 
     def _prepare(df, sfx):
         # Provenance and the context letterhead belong to a single-document
@@ -441,10 +473,10 @@ def merge_files_side_by_side(
         out.columns = [f"{c}_{sfx}" for c in out.columns]
         return out.reset_index(drop=True)
 
-    left, right = _prepare(df1, sfx1), _prepare(df2, sfx2)
+    prepared = [_prepare(df, sfx) for df, sfx in zip(frames, suffixes)]
 
     # HORIZONTAL merge = axis=1 (side by side, not stacked).
-    merged = pd.concat([left, right], axis=1)
+    merged = pd.concat(prepared, axis=1)
 
     if not str(output_filename).lower().endswith(".xlsx"):
         output_filename = f"{os.path.splitext(str(output_filename))[0] or 'merged'}.xlsx"
@@ -457,36 +489,110 @@ def merge_files_side_by_side(
     if not ok:
         return f"Horizontal merge attempted but verification failed: {verify_msg}"
 
-    # So a later "add the header details to that excel" can modify this file
-    # instead of rebuilding it. The left document is its provenance.
+    # So a later "add the header details" or "combine these two columns" can
+    # modify this file instead of rebuilding it. The leftmost document is its
+    # provenance.
     app_state.WRITTEN_EXPORTS[output_filename] = {
-        "file_id": file1_id, "context": None,
-        "pages": used1 or None, "sheets": 1,
+        "file_id": specs[0]["file_id"], "context": None,
+        "pages": used_pages[0] or None, "sheets": 1,
     }
 
-    # A side-by-side merge of unequal tables pads the shorter side with blank
-    # cells. That is not a flaw to hide behind a row count — it is the single
-    # thing the user must know before reading the file across.
+    # Sources of unequal length pad the short ones with blank cells. That is
+    # not a flaw to hide behind a row count — it is the single thing the user
+    # must know before reading the file across.
+    lengths = [len(p) for p in prepared]
     pad = ""
-    if len(left) != len(right):
-        shorter, n = ((name1, len(left)) if len(left) < len(right)
-                      else (name2, len(right)))
-        pad = (f" Row counts differ ({len(left)} vs {len(right)}): the last "
-               f"{abs(len(left) - len(right))} row(s) are blank on the "
-               f"'{shorter}' side, which has only {n} rows. Rows are matched by "
+    if len(set(lengths)) > 1:
+        short = [f"'{n}' ({l} rows)" for n, l in zip(names, lengths)
+                 if l < max(lengths)]
+        pad = (f" Sources are of unequal length: the merged file has "
+               f"{max(lengths)} rows, and {', '.join(short)} run out before "
+               f"that, so their last cells are blank. Rows are matched by "
                f"position, not by any key column.")
-    where1 = f" page(s) {', '.join(map(str, used1))}" if used1 else ""
-    where2 = f" page(s) {', '.join(map(str, used2))}" if used2 else ""
+
+    sides = []
+    for i, (name, frame, pages) in enumerate(zip(names, prepared, used_pages)):
+        where = f" page(s) {', '.join(map(str, pages))}" if pages else ""
+        position = ("Left" if i == 0 else
+                    "Right" if i == len(prepared) - 1 else f"Middle {i}")
+        sides.append(f"{position} ({name}{where}): {len(frame.columns)} "
+                     f"columns — {list(frame.columns)[:4]}")
     return (
         f"{verify_msg}\n"
-        f"Shape: {merged.shape[0]} rows × {merged.shape[1]} columns.\n"
-        f"Left ({name1}{where1}): {len(left.columns)} columns — "
-        f"{list(left.columns)[:4]}\n"
-        f"Right ({name2}{where2}): {len(right.columns)} columns — "
-        f"{list(right.columns)[:4]}\n"
-        f"No header band was written; a merged file has two source documents "
-        f"and one letterhead would misattribute half of it.{pad}"
+        f"Shape: {merged.shape[0]} rows × {merged.shape[1]} columns, "
+        f"from {len(specs)} documents placed side by side.\n"
+        + "\n".join(sides) + "\n"
+        + f"No header band was written; a merged file has {len(specs)} source "
+        f"documents and one letterhead would misattribute the rest.{pad}"
     )
+
+
+@tool
+def merge_files_side_by_side(
+    description: str = "",
+    file1_id: str = None,
+    file1_pages: list = None,
+    file2_id: str = None,
+    file2_pages: list = None,
+    output_filename: str = "merged.xlsx",
+    extra_sources: list = None,
+) -> str:
+    """Merge data from TWO OR MORE files SIDE BY SIDE — file 1's columns on
+    the left, file 2's to their right, and so on. Like a SQL JOIN but without
+    a key column. Row 1 of each file sits on the same spreadsheet row.
+
+    Use when the user says: 'side by side', 'horizontal merge', 'left side
+    right side', 'SQL join style', 'put both tables next to each other',
+    'merge/concat these files horizontally'.
+
+    DO NOT use this for stacking rows on top of each other — that is
+    export_data.
+
+    Args:
+        description: What data to take from each file
+        file1_id: First file's file_id (leftmost)
+        file1_pages: Page numbers to use from file 1 (e.g. [8,9,10])
+        file2_id: Second file's file_id
+        file2_pages: Page numbers to use from file 2 (e.g. [6,7,8,9,10])
+        output_filename: Output file name (must end in .xlsx)
+        extra_sources: For a THIRD, FOURTH or later document, a list like
+            [{"file_id": "...", "pages": [3,4]}] appended to the right
+    """
+    from app.graph.agent import _resolve_source_specs
+
+    # Which documents, and which of their pages, comes from the USER's own
+    # words — the same resolver export_data uses. The model's paraphrase drops
+    # page numbers, and picking FILE_ORDER[0]/[-1] instead is the confirmed
+    # worst bug in this project: it reads whichever documents the process
+    # happens to have loaded, not the ones this chat is about.
+    intent_text = app_state.get_current_user_prompt() or description or ""
+    resolved = _resolve_source_specs(intent_text, None)
+
+    specs = []
+    if file1_id:
+        specs.append({"file_id": file1_id, "pages": file1_pages})
+    if file2_id:
+        specs.append({"file_id": file2_id, "pages": file2_pages})
+    for extra in (extra_sources or []):
+        if isinstance(extra, dict) and extra.get("file_id"):
+            specs.append({"file_id": extra["file_id"], "pages": extra.get("pages")})
+        elif isinstance(extra, str):
+            specs.append({"file_id": extra, "pages": None})
+
+    # The model names two files even when the user named four, so whatever it
+    # left out is taken from the user's own sentence rather than dropped.
+    known = {s["file_id"] for s in specs}
+    for spec in resolved:
+        if spec["file_id"] not in known:
+            specs.append({"file_id": spec["file_id"], "pages": spec["pages"]})
+    # A file the model named but gave no pages for still has pages in the
+    # user's sentence.
+    by_fid = {s["file_id"]: s for s in resolved}
+    for spec in specs:
+        if not spec.get("pages") and spec["file_id"] in by_fid:
+            spec["pages"] = by_fid[spec["file_id"]]["pages"]
+
+    return merge_sources_side_by_side(specs, output_filename)
 
 
 def _match_columns(requested: list, available: list):
