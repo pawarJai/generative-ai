@@ -183,7 +183,25 @@ def run_code_on_files(file_ids: List[str], prompt: str, max_iters: int = 3,
     CSV"), instead of being locked to whichever file was uploaded last."""
     df_map = _build_dataframe_map(file_ids)
     if not df_map:
-        return {"text": "No tables found for the selected file(s).", "table": None, "code": None}
+        # Naming what IS loaded matters more than it looks. A bare "no tables
+        # found" is indistinguishable from "this file is broken", and the
+        # model read it that way — telling a user their intact workbook was
+        # corrupted and should be re-uploaded, when the real cause was a
+        # file_id that referred to nothing. Say which it is.
+        loaded = [fid for fid in file_ids if fid in state.FILE_KIND]
+        unknown = [fid for fid in file_ids if fid not in state.FILE_KIND]
+        available = ", ".join(
+            f"{state.FILE_ORIGINAL_NAME.get(f, f)} (id={f})"
+            for f in state.FILE_ORDER) or "none"
+        if unknown and not loaded:
+            text = (f"No document is loaded under {unknown!r} — that file_id "
+                    f"does not refer to any uploaded file, so this says nothing "
+                    f"about whether any real file is valid. Uploaded documents "
+                    f"in memory: {available}. Retry with one of those ids.")
+        else:
+            text = (f"{', '.join(state.FILE_ORIGINAL_NAME.get(f, f) for f in file_ids)} "
+                    f"is loaded but no tables were extracted from it.")
+        return {"text": text, "table": None, "code": None}
 
     schema = _schema_text(df_map)
     sheet_names = list(df_map.keys())

@@ -12,7 +12,7 @@ class QueryPlan(BaseModel):
         "qa", "page_lookup", "list_columns", "export", "complex",
         "overview", "table_of_contents", "generate", "row_sample", "data_query",
         "chat_history", "ai_meta", "general", "list_files",
-        "generate_quotation", "contract_analysis"
+        "generate_quotation", "contract_analysis", "list_sheets"
     ] = Field(
         description="qa=general document Q&A via vector search; page_lookup=specific "
                     "page; list_columns=table headers/shape; export=pull EXISTING "
@@ -30,6 +30,8 @@ class QueryPlan(BaseModel):
                     "knowledge, math, weather, casual conversation) — never touches "
                     "vector search or file state; "
                     "list_files=meta question about which files have been uploaded; "
+                    "list_sheets=the sheets/tabs of a spreadsheet, read from the "
+                    "workbook itself rather than counted from extracted tables; "
                     "generate_quotation=build a pre-filled quotation Excel from an RFQ; "
                     "contract_analysis=analyze past contracts/bids for win-loss patterns."
     )

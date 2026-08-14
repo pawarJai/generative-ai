@@ -9,13 +9,14 @@ The agent uses tool-calling instead of intent classification:
 """
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.sqlite import SqliteSaver
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import SystemMessage, ToolMessage
 from app.config import llm
 from app.graph.tools import (
     search_documents, query_table_data, list_uploaded_files,
     export_data, get_file_overview, get_page_content, get_table_of_contents,
     generate_quotation, analyze_past_contracts, modify_export,
-    merge_files_side_by_side, combine_columns
+    merge_files_side_by_side, combine_columns, list_sheets,
+    create_excel_template
 )
 # Real-world tools for general-knowledge questions that need LIVE data —
 # already implemented and tested in the legacy agent (app/agent/tools.py's
@@ -36,7 +37,8 @@ import sqlite3
 # successful merge would be "recovered" a second time by export_data —
 # overwriting the side-by-side file with a vertical stack.
 _EXPORT_TOOL_NAMES = {"export_data", "generate_quotation", "modify_export",
-                      "merge_files_side_by_side", "combine_columns"}
+                      "merge_files_side_by_side", "combine_columns",
+                      "create_excel_template"}
 _FABRICATED_FILENAME_RE = re.compile(r"\.(xlsx|csv|docx|pptx|pdf)\b", re.IGNORECASE)
 _SUCCESS_PHRASE_RE = re.compile(
     r"\b(file\s+is\s+ready|ready\s+for\s+download|download\s+ready|"
@@ -401,6 +403,22 @@ def _sheet_base_name(label) -> str:
 
 
 def _tabular_sheet_names(file_id: str) -> List[str]:
+    """Every sheet the workbook has, in workbook order.
+
+    Recorded by ingestion (FILE_META["sheets"]) rather than derived from the
+    extracted tables, because tables are a lossy view of the sheet list in
+    both directions: one sheet yields several tables ("_Raw" plus a
+    "(block N)" each), and a sheet with nothing tabular on it yields none.
+    Counting tables reported "17 sheets" for a 10-sheet workbook while
+    silently omitting the one sheet that had no table on it.
+
+    The table-derived list is kept as a fallback for files ingested before
+    that key existed and still resident in memory from an earlier boot."""
+    from app import state as app_state
+    recorded = app_state.FILE_META.get(file_id, {}).get("sheets")
+    if recorded:
+        return [str(s) for s in recorded]
+
     from app.tables.helpers import get_all_real_tables
     seen, names = set(), []
     for t in get_all_real_tables(file_id):
@@ -445,12 +463,23 @@ def _extract_requested_sheet(prompt: str, file_id: Optional[str]) -> Optional[st
 
 
 def _deterministic_sheet_export(file_id: str, sheet_name: str, out_filename: str,
-                                out_format: str) -> str:
+                                out_format: str, prompt: Optional[str] = None) -> str:
     """Export one named sheet of a tabular (xlsx/csv) file, read from the
     real tables ingestion already extracted rather than re-derived by the
     code-exec sandbox from a natural-language question — same reasoning as
     _deterministic_page_export for docling pages, applied to sheet names
-    instead of page numbers."""
+    instead of page numbers.
+
+    ``prompt``, when given, is run through app.export.spec so a column
+    selection / row filter / top-N / computed column in the same request is
+    still honoured. Confirmed production failure: a CSV's single sheet is
+    always synthetically named "data" (there is no real sheet to name), and
+    "export column data ... = Item Title, Item Quantity" contains the word
+    "data" four times — this function's own sheet-name match fires on that
+    coincidence and used to short-circuit straight to a whole-sheet export,
+    reaching this function before any column filter ever got a chance to
+    run, regardless of which caller invoked it.
+    """
     from app.tables.helpers import get_all_real_tables
     from app.export.exporters import EXPORTERS, verify_export
     from app.models import QueryPlan
@@ -463,6 +492,14 @@ def _deterministic_sheet_export(file_id: str, sheet_name: str, out_filename: str
     matches = [t for t in tables
               if _sheet_base_name(t.attrs.get("page")) == sheet_name]
     if not matches:
+        # A sheet can exist and still contribute no table (empty, or nothing
+        # tabular on it). Since sheet names now come from the workbook rather
+        # than from the extracted tables, that case is reachable — and it is
+        # a different answer than "there is no such sheet".
+        if sheet_name in _tabular_sheet_names(file_id):
+            return (f"Sheet '{sheet_name}' exists in '{src}' but no table could "
+                    f"be extracted from it — it appears to be empty. No file "
+                    f"was created.")
         return (f"No sheet named '{sheet_name}' was found in '{src}' — no "
                 f"file was created.")
 
@@ -482,13 +519,24 @@ def _deterministic_sheet_export(file_id: str, sheet_name: str, out_filename: str
     if df is None or df.empty:
         return f"Sheet '{sheet_name}' in '{src}' has no rows — no file was created."
 
+    applied = ""
+    if prompt:
+        from app.export import spec as export_spec
+        df, changes = export_spec.parse_and_apply(df, prompt)
+        if changes:
+            applied = f" Applied: {'; '.join(changes)}."
+        if df.empty:
+            return (f"The requested filter matched no rows in sheet "
+                    f"'{sheet_name}' of '{src}' — no file was created."
+                    f"{applied}")
+
     plan = QueryPlan(intent="export", sink=out_format, filename=out_filename)
     export_fn = EXPORTERS.get(out_format, EXPORTERS["excel"])
     export_fn(file_id, plan, tables=[df])
 
     path = os.path.join(OUTPUT_DIR, out_filename)
     ok, verify_msg = verify_export(path, len(df), out_format)
-    source = f" Source: '{src}' (file_id {file_id}), sheet '{sheet_name}'."
+    source = f" Source: '{src}' (file_id {file_id}), sheet '{sheet_name}'.{applied}"
     if not ok:
         return f"Export attempted but verification failed: {verify_msg}{source}"
     return f"{verify_msg}{source}"
@@ -621,6 +669,26 @@ def _deterministic_page_export(file_id: str, pages: list, out_filename: str,
                 f"document. If the user meant a different document, say so rather "
                 f"than reporting this one as empty.")
 
+    # Deterministic column-selection / row-filter / top-N / computed-column
+    # handling, same as _deterministic_sheet_export: this path never went
+    # through export_data's own column filter (or, before that existed, the
+    # sandbox), so "export page 6-10, columns = Yard No., Material code,
+    # Item" wrote every real column in the assembled table — 6 of them,
+    # none of which the user asked for by name — and the model's own answer
+    # then fabricated "Columns exported: Yard No., Material code, Item"
+    # describing a file that did not match what it said.
+    applied = ""
+    prompt_text = app_state.get_current_user_prompt()
+    if prompt_text:
+        from app.export import spec as export_spec
+        filtered_df, changes = export_spec.parse_and_apply(df, prompt_text)
+        if changes:
+            df = filtered_df
+            applied = f" Applied: {'; '.join(changes)}."
+        if df.empty:
+            return (f"The requested filter matched no rows across page(s) "
+                    f"{found} of '{src}' — no file was created.{applied}")
+
     plan = QueryPlan(intent="export", sink=out_format, filename=out_filename,
                      no_context=no_context)
     export_fn = EXPORTERS.get(out_format, EXPORTERS["excel"])
@@ -629,7 +697,7 @@ def _deterministic_page_export(file_id: str, pages: list, out_filename: str,
     path = os.path.join(OUTPUT_DIR, out_filename)
     ok, verify_msg = verify_export(path, len(df), out_format)
     source = (f" Source: '{src}' (file_id {file_id}), page(s) "
-              f"{', '.join(map(str, found))}.")
+              f"{', '.join(map(str, found))}.{applied}")
     caveat = span_note + (
         f" Note: page(s) {missing} have no extractable table in '{src}', "
         f"so they are not included." if missing else "")
@@ -1184,7 +1252,7 @@ def _attempt_recovery_export(prompt: str, file_id: str,
     # there, because it fell through to the sandbox with a mangled question.
     sheet_name = _extract_requested_sheet(prompt, file_id)
     if sheet_name:
-        return _deterministic_sheet_export(file_id, sheet_name, filename, fmt)
+        return _deterministic_sheet_export(file_id, sheet_name, filename, fmt, prompt=prompt)
 
     specs = _resolve_source_specs(prompt, file_id)
     if len(specs) > 1:
@@ -1418,6 +1486,76 @@ def _catch_false_missing_file_claim(response_text: str, prompt: str,
     return response_text + facts
 
 
+# A page-lookup answer explaining why it CAN'T show a page, in wording
+# get_page_content never produces itself (its own real strings are "does not
+# exist", "has no extractable text", or "has no separately extractable text
+# (it may be a scan)" — see get_page_content in tools.py). Anything shaped
+# like an apology for a "technical" obstacle is therefore the model's own
+# invention, not a tool result.
+_FABRICATED_PAGE_EXCUSE_RE = re.compile(
+    r"unable to (?:retrieve|extract|access|process)\b.{0,50}\bpage\b"
+    r"|\bpage\b.{0,50}\bunable to (?:retrieve|extract|access|process)\b"
+    r"|\bpage\b.{0,40}\b(?:technical (?:issue|limitation|constraint)|"
+    r"parsing limitation|not fully processed|non-standard formatting|"
+    r"technical constraints?)\b"
+    r"|\bcannot extract the exact content\b"
+    # "page 15... was not extracted or made available in the system" —
+    # phrased as a report about the SYSTEM's contents rather than a
+    # "technical issue", but no less an invention: get_page_content's own
+    # wording is always "has no extractable text" or "does not exist",
+    # never "was not extracted" or "not available in the current context".
+    r"|\bpage\b.{0,60}\b(?:content )?(?:was )?not (?:extracted|"
+    r"made available|available in (?:the )?(?:current )?(?:context|system))\b"
+    r"|\bnot (?:extracted|made available)\b.{0,40}\bpage\b",
+    re.IGNORECASE)
+
+# get_page_content's own legitimate "there's genuinely nothing here" replies
+# (see tools.py) — a real answer, not something to correct.
+_LEGITIMATE_PAGE_MISS_RE = re.compile(
+    r"does not exist|has no extractable text|"
+    r"has no separately extractable text", re.IGNORECASE)
+
+
+def _catch_fabricated_page_excuse(response_text: str, prompt: str,
+                                  file_id: Optional[str]) -> str:
+    """Replace an invented "technical limitation" excuse with the page's
+    real content, re-fetched directly.
+
+    Confirmed production failure (session 477b296a, 18:00): asked for page
+    15 of a real, successfully-ingested PDF, the model answered "the system
+    is currently unable to retrieve page 15 due to a parsing limitation —
+    likely because the PDF was not fully processed." Calling get_page_content
+    for that exact file_id and page immediately afterwards, with no code
+    changed in between, returned the real page in full — Clause 33 and 34,
+    several paragraphs. get_page_content itself never produced that excuse;
+    the model wrote it instead of either reporting what the tool actually
+    said or calling the tool at all.
+    """
+    if not file_id or not response_text:
+        return response_text
+    if not _FABRICATED_PAGE_EXCUSE_RE.search(response_text):
+        return response_text
+    from app import state as app_state
+    if app_state.FILE_KIND.get(file_id) != "docling":
+        return response_text
+    pages = _extract_requested_pages(prompt or "")
+    if not pages:
+        return response_text
+
+    from app.graph.tools import get_page_content
+    try:
+        real = get_page_content.invoke({"page_number": pages[0], "file_id": file_id})
+    except Exception:  # noqa: BLE001 -- a tool failure must not break the turn
+        return response_text
+    if (not real or not real.strip() or _FALSE_MISSING_RE.search(real)
+            or _LEGITIMATE_PAGE_MISS_RE.search(real)):
+        return response_text  # the tool agrees nothing is there — not a fabrication
+
+    return (f"{response_text}\n\n---\n\n**Correction — page {pages[0]} IS "
+            f"retrievable; the explanation above was wrong. Real content, "
+            f"read directly from the document just now:**\n\n{real}")
+
+
 # A quoted name before the word "column" is tried first: in
 # 'the "Unit Rate (INR)" column values' the unquoted branch would otherwise
 # latch onto "values" from the trailing "column values".
@@ -1484,6 +1622,20 @@ def _catch_invented_column(response_text: str, prompt: str,
         return response_text
     asked = (m.group(1) or m.group(2) or "").strip()
     if not asked or asked.lower() in _NOT_A_COLUMN:
+        return response_text
+    # A real column name is a handful of words at most, and none of them is
+    # a bare sentence word. Confirmed production failure: "...so we need to
+    # change other vise every row column yard number will come same export
+    # in T1-01.xlsx" has the word "column" 40-odd characters before an "in",
+    # so the unquoted branch of _COLUMN_ASK_RE captured the whole clause
+    # between them — "yard number will come same export" — as though it
+    # were a column name being asked about, and appended a bogus "no such
+    # column, ignore those values" correction listing every real column in
+    # an unrelated 60-column table. The single-word check above only rejects
+    # a phrase that IS one stopword; this rejects one that merely CONTAINS
+    # one, which a real multi-word column name essentially never does.
+    words = asked.split()
+    if len(words) > 5 or any(w.lower() in _NOT_A_COLUMN for w in words):
         return response_text
 
     from app import state as app_state
@@ -1559,6 +1711,20 @@ _INVENTORY_ASK_RE = re.compile(
     re.IGNORECASE)
 
 
+# Asking a spreadsheet what sheets it has. Written against the phrasings the
+# user actually typed across four failed turns ("how many sheet is there
+# list out that names", "list out this file sheet names = data-file-5",
+# "give me all sheet names list"), which is why the singular/plural and the
+# word order are both loose.
+_SHEET_ASK_RE = re.compile(
+    r"\bhow many (?:sheets?|tabs?)\b"
+    r"|\b(?:sheets?|tabs?)\s+(?:names?|list)\b"
+    r"|\b(?:names?|list)\s+(?:of\s+)?(?:the\s+|all\s+)?(?:sheets?|tabs?)\b"
+    r"|\blist\b[^.?!]{0,30}\b(?:sheets?|tabs?)\b"
+    r"|\b(?:what|which)\b[^.?!]{0,20}\b(?:sheets?|tabs?)\b",
+    re.IGNORECASE)
+
+
 def _catch_wrong_file_inventory(response_text: str, prompt: str) -> str:
     """Answer "how many files did I upload" from the registry, always.
 
@@ -1609,6 +1775,65 @@ def _name_keys(original_filename: str) -> set:
     return {re.sub(r"[^a-z0-9]", "", k.lower()) for k in keys if k}
 
 
+def _edit_distance(a: str, b: str) -> int:
+    """Levenshtein distance. Both strings here are short filename handles
+    (a few characters after digit-splitting), so the plain O(len(a)*len(b))
+    table is fine — no need for a banded/early-exit version."""
+    if a == b:
+        return 0
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i] + [0] * len(b)
+        for j, cb in enumerate(b, 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1,
+                        prev[j - 1] + (ca != cb))
+        prev = cur
+    return prev[-1]
+
+
+_TRAILING_DIGITS_RE = re.compile(r"^(.*?)(\d+)$")
+
+
+def _fuzzy_name_in_prompt(key: str, normalized_prompt: str) -> bool:
+    """Whether `key` (a normalized filename handle, e.g. "datafile4") was
+    said in the prompt, tolerating ONE typo — but only in its letters.
+
+    Confirmed production failure (17:55:36): "in data-fle-4 page number 15"
+    (a dropped 'i') never matched "data-file-4" under exact substring
+    matching, so the request silently fell through to whatever file was
+    already active instead of the one actually named — and the resulting
+    answer described the active file's real properties while calling it by
+    the name the user typed, a confusing hybrid that then poisoned several
+    turns of conversation history.
+
+    The digit suffix is matched EXACTLY, never fuzzily: "data-file-4" and
+    "data-file-1" differ by one character, same as "data-file" and
+    "data-fle", so fuzzing the whole key would make one document's name
+    match another's registry entry — silently answering about the wrong
+    numbered document, which is worse than not matching at all.
+    """
+    if key in normalized_prompt:
+        return True
+    m = _TRAILING_DIGITS_RE.match(key)
+    if not m or not m.group(1):
+        return False
+    alpha, digits = m.group(1), m.group(2)
+    # (?<!\d)...(?!\d): the digit run must be maximal — neither preceded nor
+    # followed by another digit — so "data-file-14" can never supply a match
+    # for "data-file-4" by matching just its trailing "4".
+    digit_run_re = re.compile(r"(?<!\d)" + re.escape(digits) + r"(?!\d)")
+    for dm in digit_run_re.finditer(normalized_prompt):
+        start = dm.start()
+        window_start = max(0, start - len(alpha) - 1)
+        window = normalized_prompt[window_start:start]
+        for wlen in (len(alpha) - 1, len(alpha), len(alpha) + 1):
+            if wlen <= 0 or wlen > len(window):
+                continue
+            if _edit_distance(window[len(window) - wlen:], alpha) <= 1:
+                return True
+    return False
+
+
 def _resolve_named_file(prompt: str, current_file_id: Optional[str]) -> Optional[str]:
     """The file the user NAMED in their message, when it isn't the one the
     UI has selected.
@@ -1634,13 +1859,15 @@ def _resolve_named_file(prompt: str, current_file_id: Optional[str]) -> Optional
     records = [r for r in get_all_files() if os.path.exists(r["path"])]
 
     current = next((r for r in records if r["file_id"] == current_file_id), None)
-    if current and any(k in normalized for k in _name_keys(current["original_filename"])):
+    if current and any(_fuzzy_name_in_prompt(k, normalized)
+                       for k in _name_keys(current["original_filename"])):
         return None  # the selected file is the one the user is talking about
 
     # Registry is ordered oldest-first; the newest upload of a named document
     # is the one the user means.
     for record in reversed(records):
-        if any(k in normalized for k in _name_keys(record["original_filename"])):
+        if any(_fuzzy_name_in_prompt(k, normalized)
+              for k in _name_keys(record["original_filename"])):
             return record["file_id"]
     return None
 
@@ -1663,6 +1890,39 @@ _INVENTED_LINK_RE = re.compile(r"\[([^\]]*)\]\(\s*https?://[^)]*\)")
 
 def _strip_invented_links(text: str) -> str:
     return _INVENTED_LINK_RE.sub(r"\1", text or "")
+
+
+# A file_id as this app writes them: the document name, an underscore, four
+# digits. Matched only inside backticks, which is how the model quotes one —
+# so ordinary prose mentioning a filename can't trip this.
+_FILE_ID_MENTION_RE = re.compile(r"`([\w][\w\-]*_\d{4})`")
+
+
+def _strip_phantom_file_ids(text: str) -> str:
+    """Drop sentences about a file_id that refers to no uploaded document.
+
+    The same reasoning as _strip_invented_links, for the same reason: once an
+    invention is checkpointed, the model keeps reading it back. A made-up
+    "data-file-5_9912" survived twelve turns of session 477b296a, and kept
+    reappearing as "the file `data-file-5_9912` remains inaccessible" even
+    after the answer around it had become correct — a scary sentence about a
+    file the user never had, attached to an answer about the file they do.
+
+    Only whole sentences that mention nothing else are removed; a sentence
+    carrying real content is left alone rather than silently truncated."""
+    if not text:
+        return text
+    from app.graph.tools import _is_known_file
+    out = []
+    for part in re.split(r"(?<=[.!?])\s+", text):
+        ids = _FILE_ID_MENTION_RE.findall(part)
+        if ids and all(not _is_known_file(i) for i in ids):
+            continue
+        out.append(part)
+    cleaned = " ".join(out).strip()
+    # Never blank an answer out: if the phantom was the whole of it, the user
+    # is better served by the original text than by an empty bubble.
+    return cleaned or text
 
 
 def _turn_defines_focus(named: bool, refocused: bool, existing_focus: Optional[str],
@@ -1753,6 +2013,8 @@ TOOLS = [
     get_file_overview,
     get_page_content,
     get_table_of_contents,
+    list_sheets,
+    create_excel_template,
     generate_quotation,
     analyze_past_contracts,
     web_search,
@@ -1781,8 +2043,18 @@ You have these tools available:
   heading list, not a guess from search results
 - query_table_data: for questions about numbers, rows, columns, data
   in spreadsheets — filtering, counting, aggregating
+- list_sheets: for the sheets/tabs of a spreadsheet — "how many sheets",
+  "list the sheet names", "what tabs are in this file"
 - list_uploaded_files: when user asks what files they have uploaded
-- export_data: when user wants to save/download/export data to a file
+- export_data: when user wants to save/download/export data ALREADY KNOWN
+  to be in an uploaded document to a file
+- create_excel_template: when the user hands you an explicit column list to
+  build a file AROUND ('create excel file based on this columns = ...',
+  'build a template with these headers'), rather than asking to pull
+  specific data from a document. Works with NO document uploaded at all —
+  export_data cannot. If a document happens to be uploaded, matching
+  columns are still filled from it automatically; this is not an
+  either/or choice.
 - modify_export: when user wants to CHANGE a file that already exists —
   add or remove the document header block above the table, rename columns,
   drop columns. Never re-export from scratch to satisfy one of these.
@@ -1819,12 +2091,21 @@ Rules:
    never search_documents, even if a previous answer already tried to
    guess this from search results.
 6. If the user's message contains BOTH a filename (like f1-03.xlsx) AND
-   an export verb (create, make, export, save, generate), call export_data
+   an export verb (create, make, export, save, generate), call a file tool
    IMMEDIATELY — do NOT answer the page content first. The message might
    ALSO mention page numbers (e.g. "create excel from page 6 and 7") but
    the presence of a filename + export verb means the user wants a FILE,
-   not a page content answer. Pass the FULL user message as the `question`
-   parameter to export_data so it can extract what data to export.
+   not a page content answer.
+   Which tool: if the message gives an EXPLICIT column list to build the
+   file around ("columns = X, Y, Z", "with these headers: ..."), that is
+   create_excel_template, even with no document uploaded, even if none of
+   those column names exist in one — it is designed for exactly that case
+   and will fill what it can, blank the rest, and say which is which.
+   Only use export_data when the request is to pull data you already know
+   is in an uploaded document (naming a sheet, a page range, "the working
+   sheet", existing columns by their real names) rather than handing you a
+   fresh schema to build around. Pass the FULL user message as the
+   relevant tool's data/question parameter.
    An offer to create the file later ("let me know if you'd like...") is
    NOT acceptable when the user already told you to create it.
 7. If the user asks to add header details, company/project/spec information,
@@ -1851,7 +2132,20 @@ Rules:
 13. If a request repeats one you already answered, do NOT restate the earlier
     answer more confidently. Repetition means the last answer was wrong —
     call the tool again and report what it actually returns.
-14. COLUMN COMBINE: when the user says 'combine columns', 'merge the X and
+14. SHEETS: "how many sheets", "list the sheet names", "what tabs does this
+    file have" ALWAYS means list_sheets — never query_table_data. A sheet
+    becomes SEVERAL extracted tables, so counting tables gives the wrong
+    number and reports internal labels ("Cover Sheet_Raw", "Terms (block 2)")
+    as sheet names. Report the sheet list exactly as list_sheets returns it,
+    including its markdown table, and never merge it with a count you
+    remember from earlier in this conversation.
+15. NEVER pass a file_id you inferred, remembered, or reconstructed from an
+    earlier message. Use the file_id given in this turn's active-file note,
+    or none at all. If a tool says a file_id refers to nothing, that means
+    the ID was wrong — say so and use the right one. It does NOT mean the
+    user's file is missing or corrupted, and you must not tell them to
+    re-upload it on that basis.
+16. COLUMN COMBINE: when the user says 'combine columns', 'merge the X and
     Y columns', 'concatenate columns', or 'create one column from', use
     combine_columns on the output file they name — not export_data, and not
     modify_export. Give the column names exactly as they appear in that file.
@@ -2025,6 +2319,59 @@ agent = create_react_agent(
 )
 
 
+def _repair_orphaned_tool_calls(config: dict) -> bool:
+    """Patch a thread whose checkpoint holds an AIMessage with tool_calls
+    and no matching ToolMessage — LangGraph refuses to call the model again
+    on such a thread ("Found AIMessages with tool_calls that do not have a
+    corresponding ToolMessage"), which without this permanently breaks
+    every future turn in that session_id, not just the one that triggered
+    it. Confirmed in production (session 477b296a): a call to export_data
+    with a huge `question` argument left an orphaned tool_call in the
+    checkpoint, and the very next /chat request in that thread failed
+    before the model was even invoked.
+
+    LangGraph checkpoints per superstep — the model-call step (which
+    produces the AIMessage with tool_calls) and the tool-execution step
+    (which produces the ToolMessage) are separate steps. If the process is
+    interrupted between them — a slow tool call whose request got cancelled
+    client-side, a worker restart, anything that stops execution mid-turn —
+    the first half is already durably saved and the second half never runs.
+    _trim_history's own orphan handling only covers the mirror case it can
+    itself create (a ToolMessage surviving a trim while its AIMessage gets
+    cut) — it never sees a mismatch that was already baked into the
+    checkpoint before trimming runs.
+
+    A synthetic ToolMessage is appended for each unresolved tool_call,
+    saying plainly that the call was interrupted and produced nothing —
+    never inventing a result — so the thread becomes usable again without
+    pretending the interrupted turn succeeded.
+    """
+    snapshot = agent.get_state(config)
+    messages = list(snapshot.values.get("messages", [])) if snapshot and snapshot.values else []
+    if not messages:
+        return False
+
+    resolved_ids = {getattr(m, "tool_call_id", None) for m in messages
+                    if getattr(m, "type", None) == "tool"}
+    patches = []
+    for m in messages:
+        if getattr(m, "type", None) != "ai":
+            continue
+        for tc in (getattr(m, "tool_calls", None) or []):
+            if tc.get("id") and tc["id"] not in resolved_ids:
+                patches.append(ToolMessage(
+                    content="(This tool call was interrupted before it "
+                           "completed — it produced no result. Do not "
+                           "assume it succeeded or describe an outcome "
+                           "for it; call the tool again if it is still "
+                           "needed.)",
+                    tool_call_id=tc["id"], name=tc.get("name") or "unknown"))
+    if not patches:
+        return False
+    agent.update_state(config, {"messages": patches})
+    return True
+
+
 def run_agent(prompt: str, session_id: str = "default",
                file_id: str = None) -> dict:
     """Single entry point replacing chat() in dispatch.py.
@@ -2158,6 +2505,30 @@ def run_agent(prompt: str, session_id: str = "default",
                 f"This chat has {len(owned)} uploaded document(s): {listing}. "
                 f"Use exactly this list and this count when answering — do not "
                 f"infer the number from the active file.")})
+
+    # Same reasoning, one level down: for a spreadsheet, "how many sheets"
+    # has one true answer and it is already known here. Left to the model,
+    # this went wrong twice over — in a fresh session it counted extracted
+    # tables and answered "17 sheets" for a 10-sheet workbook, and in a
+    # session whose history contained an invented file_id it reported the
+    # workbook as corrupted, four turns running. Stating the real inventory
+    # up front costs one system message and cannot be argued with.
+    # "export sheet name = cover sheet into x.xlsx" names a sheet too, and
+    # matches the same wording. That is a request for a FILE, not for the
+    # inventory — injecting "answer from exactly this" there would talk the
+    # model out of the export it was told to run.
+    if file_id and _SHEET_ASK_RE.search(prompt) and \
+            not _asks_for_a_file(prompt) and \
+            app_state.FILE_KIND.get(file_id) == "tabular":
+        from app.graph.tools import _sheet_listing
+        messages.append({"role": "system", "content": (
+            f"This message asks about the sheets of the active spreadsheet. "
+            f"Here is its real sheet inventory, read from the workbook "
+            f"itself:\n\n{_sheet_listing(file_id)}\n\n"
+            f"Answer from exactly this — the count and the names are correct "
+            f"as written. Do not count extracted tables instead, do not use a "
+            f"count from earlier in this conversation, and do not report this "
+            f"file as empty or corrupted.")})
     # A question about the conversation is answered from the conversation.
     # The thread is checkpointed and the model can see the recent part of it,
     # but asked to recall it the model has answered that it cannot — so the
@@ -2268,7 +2639,12 @@ def run_agent(prompt: str, session_id: str = "default",
 
     t0 = time.time()
     try:
-        result = agent.invoke({"messages": messages}, config=config)
+        try:
+            result = agent.invoke({"messages": messages}, config=config)
+        except ValueError as e:
+            if "corresponding ToolMessage" not in str(e) or not _repair_orphaned_tool_calls(config):
+                raise
+            result = agent.invoke({"messages": messages}, config=config)
         response_text = result["messages"][-1].content
         turn_messages = result["messages"][n_prior_messages:]
 
@@ -2299,6 +2675,11 @@ def run_agent(prompt: str, session_id: str = "default",
         # reach the user for a file that is provably fine.
         response_text = _catch_false_missing_file_claim(
             response_text, prompt, active_file_id)
+        # Same reasoning, for a page lookup that invented a "technical
+        # limitation" instead of either calling get_page_content or
+        # reporting what it actually returned.
+        response_text = _catch_fabricated_page_excuse(
+            response_text, prompt, active_file_id)
         response_text = _ensure_source_stated(response_text, turn_messages)
         response_text = _catch_invented_column(
             response_text, prompt, active_file_id)
@@ -2306,6 +2687,9 @@ def run_agent(prompt: str, session_id: str = "default",
         # Downloads are served from this app's own /files/download/ route, so
         # an absolute http(s) link to a file is always invented.
         response_text = _strip_invented_links(response_text)
+        # ...and likewise for a file_id the model invented earlier in this
+        # conversation and keeps reading back out of its own history.
+        response_text = _strip_phantom_file_ids(response_text)
 
         intent = _tool_to_intent(tool_used)
         export_filename = _resolve_export_filename(turn_messages, response_text)
@@ -2378,6 +2762,8 @@ def _tool_to_intent(tool_name: str) -> str:
         "get_file_overview": "overview",
         "get_page_content": "page_lookup",
         "get_table_of_contents": "table_of_contents",
+        "list_sheets": "list_sheets",
+        "create_excel_template": "generate",
         "generate_quotation": "generate_quotation",
         "analyze_past_contracts": "contract_analysis",
         None: "general",

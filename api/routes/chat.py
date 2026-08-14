@@ -8,6 +8,7 @@ The history endpoints below replay a thread so a chat can be resumed.
 """
 import sqlite3
 from fastapi import APIRouter, HTTPException
+from starlette.concurrency import run_in_threadpool
 from app.models import ChatRequest, ChatResponse
 from app.graph.agent import (run_agent as chat_fn, thread_messages,
                              CHECKPOINT_DB_PATH)
@@ -17,7 +18,17 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 
 @router.post("", response_model=ChatResponse)
 async def chat_endpoint(req: ChatRequest):
-    result = chat_fn(req.prompt, session_id=req.session_id, file_id=req.file_id)
+    # Confirmed production failure: chat_fn (run_agent) is a blocking sync
+    # call — an LLM round-trip, sometimes several in sequence for a tool
+    # that retries. Calling it directly from an `async def` route runs it
+    # on the server's single event-loop thread, which FREEZES THE ENTIRE
+    # SERVER for every other request — not just this one — for as long as
+    # it takes. Confirmed live: while one slow /chat call was in flight, a
+    # plain GET /files from a different session timed out completely. Every
+    # sync route below that does real work needs this same treatment; this
+    # one is fixed first because it is the one that runs the longest.
+    result = await run_in_threadpool(
+        chat_fn, req.prompt, session_id=req.session_id, file_id=req.file_id)
     allowed = {"response", "intent", "sink", "filename", "file_id",
                "table", "sql", "available_files", "target_files"}
     filtered = {k: v for k, v in result.items() if k in allowed}

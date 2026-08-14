@@ -610,13 +610,17 @@
       white-space: pre;
     }
 
-    /* Download link */
+    /* Download link. Carries its own background at all times — it was
+       invisible (black text with no fill, painted directly over the black
+       user bubble) until :hover happened to paint one in. A pill that sits
+       inside either bubble color must never rely on inheriting one. */
     .dl-link {
       display: inline-flex;
       align-items: center;
       gap: 6px;
       margin-top: 10px;
       padding: 7px 12px;
+      background: var(--white);
       border: 1px solid var(--gray-2);
       border-radius: var(--radius);
       color: var(--black);
@@ -628,6 +632,64 @@
     }
 
     .dl-link:hover { border-color: var(--black); background: var(--gray-1); }
+
+    /* Markdown inside a chat bubble. Sizes track .msg-bubble's 13px rather
+       than the page default, so a heading in an answer reads as emphasis
+       within the message instead of as a page-level title. */
+    .msg-bubble .msg-h { font-weight: 700; margin: 10px 0 4px; line-height: 1.35; }
+    .msg-bubble h1.msg-h { font-size: 15px; }
+    .msg-bubble h2.msg-h { font-size: 14px; }
+    .msg-bubble h3.msg-h { font-size: 13px; }
+    .msg-bubble .msg-h:first-child { margin-top: 0; }
+
+    .msg-bubble .msg-list { margin: 6px 0; padding-left: 20px; }
+    .msg-bubble .msg-list li { margin: 3px 0; }
+
+    .msg-bubble .msg-hr {
+      border: none;
+      border-top: 1px solid var(--gray-2);
+      margin: 10px 0;
+    }
+
+    .msg-bubble code {
+      background: var(--gray-1);
+      border: 1px solid var(--gray-2);
+      border-radius: 3px;
+      padding: 1px 5px;
+      font-family: 'Courier New', monospace;
+      font-size: 11px;
+    }
+
+    /* A dark bubble needs its own contrast — the shared tokens are tuned
+       for the light assistant bubble. */
+    .msg-row.user .msg-bubble code {
+      background: rgba(255,255,255,0.14);
+      border-color: rgba(255,255,255,0.25);
+      color: var(--white);
+    }
+
+    .ok-badge {
+      color: #166534;
+      background: #f0fdf4;
+      border: 1px solid #bbf7d0;
+      border-radius: 4px;
+      padding: 2px 8px;
+      font-weight: 600;
+    }
+
+    .err-badge { color: #991b1b; font-weight: 700; }
+
+    .warn-badge {
+      color: #92400e;
+      background: #fffbeb;
+      border-radius: 3px;
+      padding: 1px 4px;
+      font-size: 11px;
+    }
+
+    /* Inline variant: the block .dl-link is a standalone button under a
+       message; this one sits mid-sentence. */
+    a.dl-link { margin-top: 0; padding: 2px 8px; vertical-align: baseline; }
 
     /* Typing indicator */
     .typing-dots {
@@ -894,37 +956,74 @@ async function handleFile(file) {
     if (!res.ok) throw new Error((await res.json()).detail || 'Upload failed');
     const { job_id } = await res.json();
 
-    // Poll until ingestion completes
     showToast('Processing document…', 'loading');
-    await pollJob(job_id);
-
-    showToast('Document ready', 'success');
-    activeFileId = fileId;
-    addFileChip(fileId);
-    enableChat();
-    clearMessages();
-    addMsg('assistant', `Document indexed: **${file.name}**\n\nWhat would you like to know?`);
+    // Ingestion keeps running on the server regardless of how long the
+    // browser waits — a large, OCR-heavy scan can legitimately take many
+    // minutes. watchIngestJob never gives up on a job that's still running;
+    // it only stops on a real done/error, so a slow file is never mistaken
+    // for a broken one.
+    await watchIngestJob(job_id, fileId, file.name);
   } catch (err) {
     showToast(err.message, 'error');
     addMsg('error', err.message);
-  } finally {
     setProgress(false);
     fileInput.value = '';
     document.getElementById('fileInputTop').value = '';
   }
 }
 
-async function pollJob(jobId, intervalMs = 1500, maxWaitMs = 120000) {
-  const deadline = Date.now() + maxWaitMs;
-  while (Date.now() < deadline) {
-    await new Promise(r => setTimeout(r, intervalMs));
-    const res = await fetch(`${API}/jobs/${jobId}`);
-    if (!res.ok) throw new Error('Job status check failed');
-    const job = await res.json();
-    if (job.status === 'done') return job.result;
-    if (job.status === 'error') throw new Error(job.error || 'Ingestion failed');
+/* Confirmed production failure: a large PDF took longer than pollJob's old
+   hard 120-second cap, which threw "Ingestion timed out after 2 minutes" —
+   but the backend job kept running and finished successfully moments later.
+   Because activeFileId/addFileChip only ran AFTER a successful poll, that
+   upload never became selectable: the user saw a failure for an upload that
+   had, in fact, worked, and every message after it kept going to whichever
+   OLDER file happened to still be selected.
+
+   This waits as long as ingestion actually takes. It only reports failure
+   on a real job.status === 'error' from the backend, and gives a reassuring
+   status update rather than going silent (or declaring defeat) on a long
+   wait. A transient network hiccup while polling is retried, not treated
+   as the job having failed. */
+async function watchIngestJob(jobId, fileId, displayName) {
+  let waited = 0;
+  let interval = 1200;
+  let reassured = false;
+  const REASSURE_AFTER_MS = 20000;
+
+  while (true) {
+    await new Promise(r => setTimeout(r, interval));
+    waited += interval;
+    interval = Math.min(Math.round(interval * 1.3), 8000);
+
+    let job;
+    try {
+      const res = await fetch(`${API}/jobs/${jobId}`);
+      if (!res.ok) continue;
+      job = await res.json();
+    } catch (e) {
+      continue;
+    }
+
+    if (job.status === 'error') {
+      throw new Error(job.error || `Could not process ${displayName}.`);
+    }
+    if (job.status === 'done') {
+      showToast('Document ready', 'success');
+      addFileChip(fileId);
+      selectFile(fileId, { silent: true });
+      clearMessages();
+      addMsg('assistant', `Document indexed: **${displayName}**\n\nWhat would you like to know?`);
+      setProgress(false);
+      fileInput.value = '';
+      document.getElementById('fileInputTop').value = '';
+      return;
+    }
+    if (!reassured && waited >= REASSURE_AFTER_MS) {
+      reassured = true;
+      showToast('Still processing — large files can take a few minutes…', 'loading');
+    }
   }
-  throw new Error('Ingestion timed out after 2 minutes');
 }
 
 /* Documents for ONE chat, from the durable registry — so a refresh (or a
@@ -1152,7 +1251,7 @@ function addMsg(role, text) {
   const msgs = document.getElementById('messages');
   clearEmpty();
   const row = mkRow(role);
-  row.querySelector('.msg-bubble').innerHTML = renderText(text);
+  row.querySelector('.msg-bubble').innerHTML = renderText(text, { linkify: role !== 'user' });
   msgs.appendChild(row);
   scroll();
 }
@@ -1161,7 +1260,7 @@ function addMsgTable(role, text, table, sql) {
   const msgs = document.getElementById('messages');
   clearEmpty();
   const row = mkRow(role);
-  row.querySelector('.msg-bubble').innerHTML = renderText(text);
+  row.querySelector('.msg-bubble').innerHTML = renderText(text, { linkify: role !== 'user' });
   const body = row.querySelector('.msg-body');
 
   if (table && table.columns && table.rows && table.rows.length > 0) {
@@ -1189,7 +1288,7 @@ function addMsgLink(role, text, filename) {
   const msgs = document.getElementById('messages');
   clearEmpty();
   const row = mkRow(role);
-  row.querySelector('.msg-bubble').innerHTML = renderText(text);
+  row.querySelector('.msg-bubble').innerHTML = renderText(text, { linkify: role !== 'user' });
   const a = document.createElement('a');
   a.href = `${API}/files/download/${filename}`;
   a.className = 'dl-link';
@@ -1235,10 +1334,118 @@ function showTyping() {
 function removeTyping(id) { document.getElementById(id)?.remove(); }
 
 /* ── Helpers ── */
-function renderText(t) {
-  return esc(t)
-    .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-    .replace(/\n/g, '<br>');
+
+/* Markdown → HTML for chat bubbles.
+
+   Escaping happens FIRST, before any markdown rule runs, and nothing is
+   escaped again afterwards. Order matters for safety, not just for looks:
+   every rule below keys off `| - * ` # ✓`, none of which escaping alters,
+   so the rendered result is the same either way — but running the rules on
+   the raw string and escaping only what a rule happens to capture leaves
+   everything NOT captured (ordinary prose, and anything a rule skips) as
+   live HTML. Document text lands in this function verbatim, so a `<script>`
+   or an onerror= in an uploaded spreadsheet cell would execute. Escaped
+   input can't produce a tag no rule below wrote.
+
+   Block elements are handled before inline ones so a table's pipes aren't
+   already wrapped in tags by the time the table rule looks for them. */
+function renderText(t, opts) {
+  // linkify defaults on for assistant text, where a filename mention means
+  // "this is what got written to outputs/". It must stay off for the user's
+  // OWN typed message: a prompt asking to export into "terms-check.xlsx"
+  // names that file before it exists, and turning it into a live download
+  // button there is not just wrong, it looks broken — .dl-link has no
+  // background of its own (it was only ever designed to sit on the light
+  // assistant bubble), so on the black user bubble it renders as an
+  // invisible black-on-black box, visible only once :hover paints one in.
+  const linkify = !opts || opts.linkify !== false;
+
+  // Trailing newline: the block-level rules match line-at-a-time and the
+  // last row of a table or list otherwise has no line end to match.
+  let html = escHtml(String(t)) + '\n';
+
+  // 1. Tables: | col | col |  →  <table>
+  html = html.replace(
+    /(\|.+\|[ \t]*\n)((?:\|[ \t]*[-:]+[-: \t]*)+\|[ \t]*\n)((?:\|.+\|[ \t]*\n?)*)/g,
+    (match, header, separator, body) => {
+      const cells = row => {
+        const parts = row.trim().split('|');
+        if (parts[0].trim() === '') parts.shift();
+        if (parts.length && parts[parts.length - 1].trim() === '') parts.pop();
+        return parts.map(c => c.trim());
+      };
+      const head = cells(header).map(c => `<th>${c}</th>`).join('');
+      const rows = body.trim().split('\n')
+        .filter(r => r.trim())
+        .map(r => `<tr>${cells(r).map(c => `<td>${c}</td>`).join('')}</tr>`)
+        .join('');
+      return `<div class="msg-table"><table><thead><tr>${head}</tr></thead>`
+           + `<tbody>${rows}</tbody></table></div>\n`;
+    }
+  );
+
+  // 2. Fenced code blocks
+  html = html.replace(/```[\w]*\r?\n?([\s\S]*?)```/g,
+    (_, code) => `<pre class="sql-snippet">${code.trim()}</pre>`);
+
+  // 3. Inline code
+  html = html.replace(/`([^`\n]+)`/g, (_, code) => `<code>${code}</code>`);
+
+  // 4. Headings
+  html = html.replace(/^### (.+)$/gm, '<h3 class="msg-h">$1</h3>');
+  html = html.replace(/^## (.+)$/gm,  '<h2 class="msg-h">$1</h2>');
+  html = html.replace(/^# (.+)$/gm,   '<h1 class="msg-h">$1</h1>');
+
+  // 5. Bold / italic
+  html = html.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
+  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/(^|[^\w*])\*([^*\n]+)\*(?!\w)/g, '$1<em>$2</em>');
+
+  // 6. Bullet lists
+  html = html.replace(/(?:^[-*] .+\n?)+/gm, block => {
+    const items = block.trim().split('\n')
+      .map(line => `<li>${line.replace(/^[-*] /, '')}</li>`).join('');
+    return `<ul class="msg-list">${items}</ul>\n`;
+  });
+
+  // 7. Numbered lists
+  html = html.replace(/(?:^\d+\. .+\n?)+/gm, block => {
+    const items = block.trim().split('\n')
+      .map(line => `<li>${line.replace(/^\d+\. /, '')}</li>`).join('');
+    return `<ol class="msg-list">${items}</ol>\n`;
+  });
+
+  // 8. Horizontal rule
+  html = html.replace(/^-{3,}$/gm, '<hr class="msg-hr">');
+
+  // 9. A verified export is the one line the user is looking for. The badge
+  //    stops before the " Source: ..." clause — that sentence is provenance,
+  //    and highlighting it too turns half the bubble green.
+  html = html.replace(/✓ Verified:[^\n<]*?(?=\s+Source:|\n|$)/g,
+    m => `<span class="ok-badge">${m}</span>`);
+
+  // 10. Failures, equally loud in the other direction.
+  html = html.replace(/\b(FAILED|EXPORT FAILED|ERROR):/g, '<span class="err-badge">$1:</span>');
+
+  // 11. col_0/col_1 in an answer means header recovery fell through — the
+  //     data is real but its column names are placeholders. Worth seeing.
+  html = html.replace(/\bcol_\d+\b/g, '<span class="warn-badge">$&</span>');
+
+  // 12. Output filenames become download links. Source documents are named
+  //     in almost every answer ("Source: 'data-file-5.xlsx'") and are not
+  //     downloadable through this endpoint, so they stay plain text.
+  if (linkify) {
+    html = html.replace(/\b([\w][\w\-]*\.(?:xlsx|csv|docx|pptx))\b/gi, name =>
+      /^data-file/i.test(name) ? name
+        : `<a href="${API}/files/download/${encodeURIComponent(name)}" class="dl-link" target="_blank">⬇ ${name}</a>`);
+  }
+
+  // 13. Remaining newlines, last — the blocks above are already HTML.
+  //     A block element brings its own vertical spacing, so the newlines
+  //     around it must not also become <br>: they stack into a visible gap.
+  html = html.replace(/\n*(<(?:div class="msg-table"|ul|ol|h[123]|hr|pre)\b)/g, '$1')
+             .replace(/(<\/(?:div|ul|ol|h[123]|pre)>|<hr class="msg-hr">)\n*/g, '$1');
+  return html.replace(/\n(?![\s]*$)/g, '<br>').replace(/\s+$/, '');
 }
 
 function clearEmpty() {
@@ -1277,9 +1484,13 @@ function scroll() {
   m.scrollTop = m.scrollHeight;
 }
 
-function esc(s) {
+function escHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
+
+/* Kept as the name the rest of the file already calls; one implementation
+   so the two can never drift apart. */
+function esc(s) { return escHtml(s); }
 
 document.getElementById('msgInput').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }

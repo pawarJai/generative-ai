@@ -101,11 +101,12 @@ def _clean_block_to_table(block: pd.DataFrame) -> Optional[pd.DataFrame]:
     return data.reset_index(drop=True)
 
 
-def _ingest_xls_legacy(path: str) -> Tuple[List[pd.DataFrame], List[str]]:
+def _ingest_xls_legacy(path: str) -> Tuple[List[pd.DataFrame], List[str], List[str]]:
     """Read old-format .xls files via xlrd (openpyxl can't handle them)."""
     sheets = pd.read_excel(path, sheet_name=None, engine="xlrd", header=None)
     tables = []
     all_text = []
+    sheet_names = list(sheets.keys())
     for sheet_name, raw_df in sheets.items():
         raw_df = raw_df.reset_index(drop=True)
         
@@ -124,7 +125,7 @@ def _ingest_xls_legacy(path: str) -> Tuple[List[pd.DataFrame], List[str]]:
                 label = sheet_name if len(blocks) == 1 else f"{sheet_name} (block {bi + 1})"
                 cleaned.attrs["page"] = label
                 tables.append(cleaned)
-    return tables, all_text
+    return tables, all_text, sheet_names
 
 
 def ingest_tabular(path: str, file_id: str) -> None:
@@ -132,11 +133,21 @@ def ingest_tabular(path: str, file_id: str) -> None:
     ext = os.path.splitext(path)[1].lower()
     tables = []
     all_text = []
-    
+    # The workbook's OWN sheet names, in workbook order — recorded separately
+    # from the extracted tables because they are not recoverable from them.
+    # One sheet becomes several tables (a "_Raw" whole-sheet dump plus a
+    # "(block N)" per detected sub-table), and a sheet holding nothing
+    # tabular becomes none at all. Asked "how many sheets are there", the
+    # only honest source is this list: counting tables answered 17 for a
+    # 10-sheet workbook, and dropped 'Delivery' (no extractable table)
+    # entirely. See app.graph.tools.list_sheets.
+    sheet_names: List[str] = []
+
     if ext == ".xls":
-        tables, all_text = _ingest_xls_legacy(path)
+        tables, all_text, sheet_names = _ingest_xls_legacy(path)
     elif ext == ".xlsx":
-        for sheet_name in pd.ExcelFile(path).sheet_names:
+        sheet_names = list(pd.ExcelFile(path).sheet_names)
+        for sheet_name in sheet_names:
             raw = _unmerge_and_fill(path, sheet_name)
             
             sheet_text = _df_to_text(raw)
@@ -163,11 +174,15 @@ def ingest_tabular(path: str, file_id: str) -> None:
         df.columns = dedupe_columns(df.columns)
         df.attrs["page"] = "data"
         tables.append(df)
+        sheet_names = ["data"]
 
     state.TABULAR_TABLES[file_id] = tables
     state.FILE_KIND[file_id] = "tabular"
-    state.FILE_META[file_id] = {"toc": [{"text": f"Sheet/Block: {t.attrs['page']}", "page": t.attrs["page"]}
-                                         for t in tables]}
+    state.FILE_META[file_id] = {
+        "toc": [{"text": f"Sheet/Block: {t.attrs['page']}", "page": t.attrs["page"]}
+                for t in tables],
+        "sheets": sheet_names,
+    }
 
     # Generate description for embedding
     desc_parts = []

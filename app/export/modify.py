@@ -28,6 +28,7 @@ import pandas as pd
 
 from app import state
 from app.config import OUTPUT_DIR
+from app.export import spec as export_spec
 from app.export.exporters import EXPORTERS, band_offset, verify_export
 from app.models import QueryPlan
 
@@ -107,9 +108,21 @@ def parse_instruction(text: str) -> Dict:
     into something else.
     """
     ops: Dict = {"rename": {}, "positional_rename": [], "drop": [],
-                 "context": None}
+                 "context": None, "raw_text": text}
     if not text:
         return ops
+
+    # Row-reducing operations (filter, top/bottom-N) and computed columns need
+    # the file's real columns to resolve, which aren't available yet at parse
+    # time — apply_ops does that once the frame is loaded. This flag only
+    # answers "is there something here worth loading the file for", from the
+    # instruction text alone, so modify() can still short-circuit unrecognized
+    # instructions before touching disk.
+    ops["may_reduce_rows"] = bool(
+        export_spec._FILTER_RE.search(text)
+        or export_spec._TOP_RE.search(text)
+        or export_spec._BOTTOM_RE.search(text))
+    ops["may_add_column"] = bool(export_spec._COMPUTE_RE.search(text))
 
     # Spans already claimed by a rename or drop are column names. They are
     # masked out before the header test, because a column called "Spec No."
@@ -220,6 +233,29 @@ def apply_ops(df: pd.DataFrame, ops: Dict) -> Tuple[pd.DataFrame, List[str]]:
         else:
             out = out.drop(columns=[actual])
             changes.append(f"dropped column '{actual}'")
+
+    # Filter / top-N / computed-column, resolved against THIS frame's real
+    # columns now that it's loaded — parse_instruction could only detect
+    # that the instruction text mentions one, not resolve it.
+    raw_text = ops.get("raw_text") or ""
+    if ops.get("may_add_column"):
+        computed = export_spec.extract_computed_column(raw_text, list(out.columns))
+        if computed:
+            out = export_spec.apply_computed_column(out, computed)
+            changes.append(f"added computed column '{computed['name']}'")
+    if ops.get("may_reduce_rows"):
+        filt = export_spec.extract_row_filter(raw_text, list(out.columns))
+        if filt:
+            before = len(out)
+            out = export_spec.apply_row_filter(out, filt)
+            changes.append(f"filtered where '{filt[0]}' = '{filt[1]}' "
+                           f"({before} -> {len(out)} rows)")
+        limit = export_spec.extract_row_limit(raw_text)
+        if limit:
+            kind, n = limit
+            out = export_spec.apply_row_limit(out, limit)
+            changes.append(f"kept {'top' if kind == 'head' else 'bottom'} {n} rows")
+
     return out, changes
 
 
@@ -234,12 +270,15 @@ def modify(filename: str, instruction: str, file_id: Optional[str] = None) -> st
 
     ops = parse_instruction(instruction)
     if not any([ops["rename"], ops["positional_rename"], ops["drop"],
-                ops["context"] is not None]):
+                ops["context"] is not None, ops.get("may_reduce_rows"),
+                ops.get("may_add_column")]):
         return ("I can change an existing export in these ways: add or remove "
                 "the document header band, rename columns (by name or by "
                 "position, e.g. 'rename the first two columns to Category and "
-                "Description'), or drop columns. Say which one you want for "
-                f"{os.path.basename(path)}.")
+                "Description'), drop columns, keep only rows where a column "
+                "equals a value, keep only the top/bottom N rows, or add a "
+                "computed column (e.g. 'add a column Total = Price * Qty'). "
+                f"Say which one you want for {os.path.basename(path)}.")
 
     frames, sheet_names = load_export(path)
     if not frames:
@@ -252,6 +291,15 @@ def modify(filename: str, instruction: str, file_id: Optional[str] = None) -> st
         frames[i], changes = apply_ops(frame, ops)
         frames[i].attrs["sheet_name"] = sheet_names[i]
         all_changes.extend(changes)
+
+    rows_after = sum(len(f) for f in frames)
+    if ops.get("may_reduce_rows") and rows_after == 0:
+        return (f"That filter matched no rows in {os.path.basename(path)} — "
+                f"nothing was changed. Applied: "
+                f"{'; '.join(all_changes) if all_changes else 'nothing'}.")
+    # A filter or top/bottom-N limit intentionally shrinks the table; the
+    # verification below must not treat that as a truncated/broken export.
+    expected_rows = rows_after if ops.get("may_reduce_rows") else rows_before
 
     want_context = ops["context"]
     context = provenance.get("context")
@@ -292,7 +340,7 @@ def modify(filename: str, instruction: str, file_id: Optional[str] = None) -> st
     EXPORTERS[fmt](provenance.get("file_id") or file_id or "modified", plan,
                    tables=frames)
 
-    ok, message = verify_export(staged_path, rows_before, fmt)
+    ok, message = verify_export(staged_path, expected_rows, fmt)
     if not ok:
         if os.path.exists(staged_path):
             os.remove(staged_path)

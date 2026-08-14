@@ -10,6 +10,195 @@ from app.tables.helpers import get_all_real_tables, get_page_markdown
 from app.config import vector_db
 
 
+def _build_template_export(columns: list, filename: str, out_format: str = "excel",
+                           constants: Optional[dict] = None,
+                           file_id: Optional[str] = None) -> str:
+    """Build a file from an EXPLICIT column list — with or without a source
+    document, unlike export_data (which always pulls FROM a document and
+    refuses outright with nothing uploaded, or when none of the requested
+    columns exist in what IS uploaded).
+
+    Confirmed the actual gap in production: "create excel file based on
+    this columns = Sr No, Group, ... export in w1-02.xlsx" was routed to
+    export_data every time (rule: filename + export verb -> export_data),
+    which either said "No files uploaded" with nothing active, or "none of
+    these columns exist" with a document active whose real schema doesn't
+    contain most of them. Both are TRUE, individually-correct, unhelpful
+    answers to a request that was never really "pull this data from my
+    document" in the first place — it was "build me a file with these
+    headers, filled in wherever you actually can be, blank elsewhere."
+
+    Every cell is filled from exactly one of three sources, and every
+    caller learns which: a real, fuzzy-matched column in a resolved source
+    document; an explicit constant the caller supplied; or blank. Nothing
+    is ever invented to fill a gap.
+    """
+    from app.export import spec as export_spec
+    from app.export.exporters import EXPORTERS
+    from app.models import QueryPlan
+    from app.config import OUTPUT_DIR
+    import pandas as pd
+
+    from app.export.spec import _LEADING_LIST_MARKER_RE, _clean as _clean_spec
+
+    constants = {str(k): v for k, v in (constants or {}).items()}
+    # The model routinely passes the user's own "1.Sr No" straight through
+    # as the column name — confirmed live: a real request produced headers
+    # literally reading "1.Sr No", "2.Group", etc. Stripped here rather
+    # than trusted to already be clean, the same reasoning as every other
+    # deterministic guard in this file. Punctuation after the digit is
+    # required (see _LEADING_LIST_MARKER_RE) so a real column name that
+    # happens to start with a digit, like "6 Ship Set", is left alone.
+    columns = [_clean_spec(_LEADING_LIST_MARKER_RE.sub("", str(c)))
+              for c in (columns or [])]
+    columns = [c for c in columns if c]
+    if not columns:
+        return "No column names were given — say which columns the file should have."
+
+    filename = filename or "template.xlsx"
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "xlsx"
+    out_format = {"xlsx": "excel", "xls": "excel"}.get(ext, out_format)
+
+    # An optional source: an explicit, known file_id, or the ONE file
+    # active in this session — never a guess among several, same rule
+    # export_data itself follows for an omitted file_id.
+    target = None
+    if file_id and _is_known_file(file_id):
+        target = file_id
+    elif not file_id and len(app_state.FILE_ORDER) == 1:
+        target = app_state.FILE_ORDER[0]
+
+    source_cols, source_df, row_count = {}, None, 0
+    if target:
+        from app.tables.helpers import get_all_real_tables as _get_all_real_tables
+        candidates = [t for t in _get_all_real_tables(target) if len(t)]
+        best, best_score = None, 0
+        for t in candidates:
+            score = sum(
+                1 for c in columns
+                if len(export_spec._norm_key(c)) >= 3 and any(
+                    export_spec._fuzzy_contains(export_spec._norm_key(c),
+                                                export_spec._norm_key(rc))
+                    for rc in t.columns))
+            if score > best_score:
+                best, best_score = t, score
+        if best is not None and best_score:
+            source_df = best
+            row_count = len(best)
+            for c in columns:
+                if len(export_spec._norm_key(c)) < 3:
+                    continue
+                for real_col in best.columns:
+                    if export_spec._fuzzy_contains(export_spec._norm_key(c),
+                                                   export_spec._norm_key(real_col)):
+                        source_cols[c] = real_col
+                        break
+
+    if not row_count:
+        row_count = 1 if constants else 0
+
+    data = {}
+    filled_source, filled_constant, blank = [], [], []
+    for c in columns:
+        const_key = next((k for k in constants
+                          if export_spec._norm_key(k) == export_spec._norm_key(c)), None)
+        if c in source_cols:
+            vals = list(source_df[source_cols[c]])[:row_count]
+            vals += [""] * (row_count - len(vals))
+            if const_key:
+                vals = [constants[const_key]] * row_count
+                filled_constant.append(c)
+            else:
+                filled_source.append(c)
+            data[c] = vals
+        elif const_key is not None:
+            data[c] = [constants[const_key]] * row_count
+            filled_constant.append(c)
+        else:
+            data[c] = [""] * row_count
+            blank.append(c)
+
+    df = pd.DataFrame(data, columns=columns)
+    plan = QueryPlan(intent="export", sink=out_format, filename=filename, no_context=True)
+    export_fn = EXPORTERS.get(out_format, EXPORTERS["excel"])
+    export_fn(target or "template", plan, tables=[df])
+
+    path = os.path.join(OUTPUT_DIR, filename)
+    if not os.path.exists(path):
+        return f"FAILED — {filename} was not written."
+    try:
+        written_cols = list(pd.read_excel(path).columns) if out_format == "excel" \
+            else list(pd.read_csv(path).columns)
+    except Exception as e:  # noqa: BLE001 -- report, don't crash the turn
+        return f"FAILED — {filename} could not be read back to verify: {e}"
+    if written_cols != columns:
+        return (f"FAILED — {filename} was written but its columns "
+                f"({written_cols}) do not match what was requested "
+                f"({columns}).")
+
+    parts = [f"✓ Created {filename} — {len(columns)} columns, {row_count} row(s)."]
+    if filled_source:
+        parts.append(f"Filled from '{app_state.FILE_ORIGINAL_NAME.get(target, target)}': "
+                     f"{', '.join(filled_source)}.")
+    if filled_constant:
+        parts.append(f"Set to a fixed value for every row: {', '.join(filled_constant)}.")
+    if blank:
+        parts.append(f"Left blank — not found in any uploaded document and no "
+                     f"value was given for them: {', '.join(blank)}.")
+    return " ".join(parts)
+
+
+@tool
+def create_excel_template(columns: list, filename: str, constants: dict = None,
+                          file_id: str = None) -> str:
+    """Build an Excel file from an EXPLICIT list of column headers — works
+    WITHOUT any document uploaded, and does not require every column to
+    exist in one if a document IS uploaded.
+
+    Use this instead of export_data when the user hands you a column list
+    to build a file AROUND ('create excel file based on this columns = ...',
+    'build a template with these headers', 'make a file with columns X, Y,
+    Z') rather than asking you to pull specific data you already know is in
+    an uploaded document. If the user's message has no clear reference to
+    an uploaded document at all, this is almost always the right tool —
+    export_data will refuse with "no files uploaded" for the exact same
+    request, which is correct but not what the user wants.
+
+    Each column is filled from exactly one source, and the reply says
+    which: a real, matching column in an uploaded document (if one is
+    active or file_id is given); a fixed value from `constants`, applied to
+    every row (e.g. the user said "set Yard No. to BY531-536 for all
+    rows" -> constants={"Yard No.": "BY531-536"}); or left blank. Never
+    invents a value for a column that has neither.
+
+    Args:
+        columns: Exact column headers, in the order the file should have them.
+        filename: Output filename.
+        constants: {column_name: value} to broadcast into every row of that
+                  column, for values the user stated directly rather than
+                  asked to be pulled from a document (e.g. a fixed yard
+                  number, a fixed project code).
+        file_id: Optional — a specific uploaded document to pull real data
+                 from for any column that matches it. Omit if none was
+                 named; the single active file (if there is exactly one) is
+                 used automatically.
+    """
+    return _build_template_export(columns, filename, "excel", constants, file_id)
+
+
+def _is_known_file(file_id: str) -> bool:
+    """Whether a file_id refers to a document that actually exists — either
+    loaded in memory now, or recorded in the durable upload registry (it can
+    be lazily restored from there; see agent._restore_file_if_needed)."""
+    if file_id in app_state.FILE_KIND or file_id in app_state.FILE_ORDER:
+        return True
+    try:
+        from app.persistence import get_file
+        return get_file(file_id) is not None
+    except Exception:  # noqa: BLE001 -- registry unavailable must not break a query
+        return False
+
+
 def resolve_target_file(file_id: Optional[str], question: str = "") -> Optional[str]:
     """The one document a tool should read, in descending order of evidence.
 
@@ -26,8 +215,20 @@ def resolve_target_file(file_id: Optional[str], question: str = "") -> Optional[
     then the active file, and only then a lone loaded file. With several
     candidates and no signal, returns None — a tool saying "which file?"
     beats a tool silently answering about a document nobody mentioned.
+
+    The explicit argument only counts if the file_id is REAL. Confirmed
+    production failure (session 477b296a): asked to export a sheet, the model
+    once answered with a made-up file_id, "data-file-5_9912" — a plausible
+    shape, never uploaded, no registry record. That answer was checkpointed
+    into the conversation, so from then on the model read its own invented id
+    back out of the history and passed it to tools, which trusted it, found
+    no tables under it, and reported the user's perfectly good workbook as
+    "corrupted... please re-upload" — in four separate turns, over three
+    hours, while the same questions answered correctly in a fresh session.
+    An id nothing knows about is not evidence; fall through to the evidence
+    that is real.
     """
-    if file_id:
+    if file_id and _is_known_file(file_id):
         return file_id
 
     if question:
@@ -139,14 +340,80 @@ def get_table_of_contents(file_id: str = None) -> str:
     Args:
         file_id: Optional specific file. If None, uses the active file.
     """
-    target = file_id or app_state.get_active_file_id()
+    target = resolve_target_file(file_id)
     if not target:
         return "No file selected."
+    # A spreadsheet's structure is its sheet list, and the stored "toc" for a
+    # tabular file is one entry per extracted TABLE — several per sheet.
+    # Answering a structure question from it reported 17 headings for a
+    # 10-sheet workbook, which the model then presented as "17 sheets".
+    if app_state.FILE_KIND.get(target) == "tabular":
+        return _sheet_listing(target)
     toc = app_state.FILE_META.get(target, {}).get("toc", [])
     if not toc:
         return f"No table of contents / headings were detected in '{target}'."
     lines = [f"- {t['text']} (p.{t['page']})" for t in toc]
     return f"Table of contents for '{target}' ({len(toc)} headings):\n" + "\n".join(lines)
+
+
+@tool
+def list_sheets(file_id: str = None) -> str:
+    """List the sheets (tabs) in an uploaded spreadsheet, with each one's
+    row and column count. Use this for ANY question about a spreadsheet's
+    sheets: "how many sheets are there", "list the sheet names", "what tabs
+    does this file have", "which sheet has X rows".
+
+    This reads the workbook's real sheet list recorded at upload time. Do NOT
+    use query_table_data for these questions — that runs generated code over
+    the EXTRACTED TABLES, of which there are several per sheet, so it counts
+    sheets wrong and reports internal table labels ("Cover Sheet_Raw",
+    "Terms (block 2)") as if they were sheet names.
+
+    Args:
+        file_id: Optional specific file. If None, uses the active file.
+    """
+    target = resolve_target_file(file_id)
+    if not target:
+        return "No file selected."
+    return _sheet_listing(target)
+
+
+def _sheet_listing(target: str) -> str:
+    """The sheet inventory itself, callable from either tool without going
+    back through the tool wrapper."""
+    from app.graph.agent import _tabular_sheet_names, _sheet_base_name
+
+    name = app_state.FILE_ORIGINAL_NAME.get(target, target)
+    if app_state.FILE_KIND.get(target) != "tabular":
+        return (f"'{name}' is not a spreadsheet — it has pages, not sheets. "
+                f"Use get_table_of_contents for its structure.")
+
+    sheets = _tabular_sheet_names(target)
+    if not sheets:
+        return f"No sheets were recorded for '{name}'."
+
+    # Group the extracted tables under the sheet each came from. The "_Raw"
+    # table is the whole sheet as-is, so it — not a sub-block — gives the
+    # sheet's true size.
+    by_sheet = {}
+    for t in get_all_real_tables(target):
+        by_sheet.setdefault(_sheet_base_name(t.attrs.get("page")), []).append(t)
+
+    rows = []
+    for i, sheet in enumerate(sheets, 1):
+        tables = by_sheet.get(sheet, [])
+        raw = [t for t in tables
+               if str(t.attrs.get("page", "")).endswith("_Raw")]
+        best = raw[0] if raw else (max(tables, key=len) if tables else None)
+        if best is None:
+            rows.append(f"| {i} | {sheet} | — | — | empty (no table extracted) |")
+        else:
+            rows.append(f"| {i} | {sheet} | {len(best)} | {best.shape[1]} | "
+                        f"{len(tables)} table(s) extracted |")
+
+    return (f"**{name}** has **{len(sheets)} sheet(s)**:\n\n"
+            f"| # | Sheet name | Rows | Columns | Notes |\n"
+            f"|---|---|---|---|---|\n" + "\n".join(rows))
 
 
 @tool
@@ -255,6 +522,7 @@ def export_data(question: str, format: str = "excel",
                                   _deterministic_sheet_export)
 
     default_name = filename or f"export.{'xlsx' if format == 'excel' else format}"
+    intent_text = app_state.get_current_user_prompt() or question
 
     # A side-by-side request must never be answered by stacking, whichever
     # route reached this tool. The model choosing export_data is only one of
@@ -280,6 +548,19 @@ def export_data(question: str, format: str = "excel",
     # user never mentioned, while reporting success. See resolve_target_file.
     target = resolve_target_file(file_id, question)
     if not target and not app_state.FILE_ORDER:
+        # "No files uploaded" is correct but not the whole answer when the
+        # request itself hands over an explicit column list — that shape of
+        # request is create_excel_template's job, not export_data's, and
+        # the model routinely calls this tool for it anyway (both are
+        # "create a file" on the surface). Confirmed production failure:
+        # "create excel file based on this columns = Sr No, Group, ... "
+        # with nothing uploaded got "No files have been uploaded, so I
+        # cannot generate..." three turns running, when a blank template
+        # with exactly those headers is a completely reasonable answer.
+        from app.export import spec as export_spec
+        tokens = export_spec.extract_requested_column_tokens(intent_text)
+        if len(tokens) >= 3:
+            return _build_template_export(tokens, default_name, format)
         return "No files uploaded yet."
     if not target:
         names = ", ".join(f"{app_state.FILE_ORIGINAL_NAME.get(f, f)} (id={f})"
@@ -302,7 +583,6 @@ def export_data(question: str, format: str = "excel",
     # the request fell through to the sandbox, which answered that the
     # document "does not contain a table with the exact columns" — about a
     # table that is plainly there on pages 7 to 10.
-    intent_text = app_state.get_current_user_prompt() or question
 
     # A named SHEET of a spreadsheet, matched against the file's own real
     # sheet names first — before the sandbox ever sees a question, and
@@ -314,7 +594,7 @@ def export_data(question: str, format: str = "excel",
                  or _extract_requested_sheet(question, target_files[0]))
     if sheet_name:
         return _deterministic_sheet_export(
-            target_files[0], sheet_name, default_name, format)
+            target_files[0], sheet_name, default_name, format, prompt=intent_text)
 
     pages = _extract_requested_pages(intent_text) or _extract_requested_pages(question)
     if pages and app_state.FILE_KIND.get(target_files[0]) == "docling":
@@ -328,19 +608,80 @@ def export_data(question: str, format: str = "excel",
             whole_table=bool(_WHOLE_TABLE_RE.search(intent_text)),
             no_context=_wants_bare_table(intent_text))
 
+    # Deterministic column-selection / row-filter / top-N / computed-column
+    # handling, read from the user's own words against the file's REAL
+    # columns — not from run_code_on_files below, an LLM sandbox.
+    #
+    # Confirmed production failure (session 477b296a, data-file-3): "export
+    # two column data ... = Item Title, Item Quantity" wrote all 7 columns
+    # to the output file, because this tool built the exported DataFrame
+    # from the sandbox's result and handed it straight to the exporter with
+    # no column filter ever applied — prep_tables's deterministic filter
+    # (app.export.schema_map) was reachable from other callers but not this
+    # one. Scoring each candidate table against the prompt, rather than
+    # assuming target_files[0]'s first table, is needed because a tabular
+    # file can hold several extracted tables and only one actually has the
+    # named columns.
+    from app.tables.helpers import get_tables_for_scope
+    from app.export import spec as export_spec
+    from app.config import OUTPUT_DIR
+
+    candidate_tables = [t for t in get_tables_for_scope(target_files) if len(t)]
+    best_table, best_score = None, 0
+    for t in candidate_tables:
+        cols = list(t.columns)
+        score = (len(export_spec.extract_requested_columns(intent_text, cols))
+                 + (2 if export_spec.extract_row_filter(intent_text, cols) else 0)
+                 + (2 if export_spec.extract_computed_column(intent_text, cols) else 0)
+                 + (1 if export_spec.extract_row_limit(intent_text) else 0))
+        if score > best_score:
+            best_table, best_score = t, score
+
+    if best_table is not None and best_score > 0:
+        result_df, changes = export_spec.parse_and_apply(best_table, intent_text)
+        applied = "; ".join(changes) if changes else "no changes"
+        if result_df.empty:
+            return (f"The requested filter matched no rows in '{target}' — "
+                    f"no file was created. Applied: {applied}.")
+        plan = QueryPlan(intent="export", sink=format, filename=default_name)
+        export_fn = EXPORTERS.get(format, EXPORTERS["csv"])
+        msg = export_fn(target_files[0], plan, tables=[result_df])
+        path = os.path.join(OUTPUT_DIR, default_name)
+        ok, verify_msg = verify_export(path, len(result_df), format)
+        if not ok:
+            return f"Export attempted but verification failed: {verify_msg}\nApplied: {applied}"
+        return (f"{verify_msg}\nApplied: {applied}\n\n"
+                f"Data preview:\n{result_df.head(3).to_markdown(index=False)}")
+
+    # best_score == 0 means NONE of the deterministic checks above found
+    # anything — no real column matched, no filter, no limit, no computed
+    # column. That is exactly the shape of an explicit-column-list request
+    # naming a schema this document doesn't have (a quotation template
+    # built from a spec, not data pulled from the file) — not a case the
+    # LLM sandbox below is any better positioned to answer, and confirmed
+    # in production to take several minutes doing it (repeated retries
+    # against columns that were never going to match) before saying so.
+    # Skipping straight to the honest, fast answer here also means the
+    # user never has to depend on the model choosing create_excel_template
+    # correctly on its own.
+    if best_score == 0:
+        from app.export import spec as export_spec
+        tokens = export_spec.extract_requested_column_tokens(intent_text)
+        if len(tokens) >= 3:
+            return _build_template_export(tokens, default_name, format,
+                                          file_id=target_files[0])
+
     result = run_code_on_files(target_files, question)
     if not result.get("table"):
         return f"Could not extract data: {result['text']}"
 
     df = pd.DataFrame(result["table"]["rows"], columns=result["table"]["columns"])
-    out_filename = filename or f"export.{format}"
-    plan = QueryPlan(intent="export", sink=format, filename=out_filename)
+    plan = QueryPlan(intent="export", sink=format, filename=default_name)
     export_fn = EXPORTERS.get(format, EXPORTERS["csv"])
     msg = export_fn(target_files[0], plan, tables=[df])
 
     # CRITICAL: verify the file actually landed on disk
-    from app.config import OUTPUT_DIR
-    path = os.path.join(OUTPUT_DIR, out_filename)
+    path = os.path.join(OUTPUT_DIR, default_name)
     ok, verify_msg = verify_export(path, len(df), format)
     if not ok:
         return f"Export attempted but verification failed: {verify_msg}"

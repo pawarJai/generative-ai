@@ -1,4 +1,17 @@
 """FastAPI app entry point. Run with: uvicorn app.main:app --reload"""
+import os
+# Confirmed production failure: HuggingFace's tokenizers library forks a
+# background worker process on first use when parallelism isn't explicitly
+# disabled. Under uvicorn --reload that fork has been observed inheriting
+# the server's own listening socket file descriptor — so after the real
+# ASGI worker exits (a reload, a crash), that leftover forked process keeps
+# `lsof -i :8000` showing something LISTENing, giving no indication the app
+# itself is gone. New connections then hang forever with zero server-side
+# logging, because nothing is actually there to accept() and route them.
+# Must be set before torch/transformers/tokenizers are imported anywhere,
+# so this line has to stay the first thing this entry module does.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware

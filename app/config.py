@@ -36,6 +36,16 @@ llm = ChatOpenAI(
     openai_api_base=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
     temperature=0.0,
     max_tokens=4096,
+    # Confirmed production failure: with no timeout set, a stalled call to
+    # OpenRouter blocked a /chat request for 15+ minutes with near-zero CPU
+    # use — the process wasn't stuck computing, it was waiting on a network
+    # read that had no deadline. Every LLM call in this app goes through
+    # this one client, so bounding it here bounds all of them at once,
+    # including the code-exec sandbox's retry loop, which calls this
+    # multiple times per request and would otherwise multiply an unbounded
+    # hang instead of just having one.
+    timeout=90,
+    max_retries=1,
 )
 
 _converter = DocumentConverter()

@@ -37,3 +37,4 @@ PLAN-*.md
 # Editor / OS
 .vscode/
 .DS_Store
+.chat-rendering-preview.html
