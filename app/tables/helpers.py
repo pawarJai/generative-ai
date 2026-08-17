@@ -244,6 +244,79 @@ def _restore_dropped_column(df: pd.DataFrame, name: str, file_id, page, table,
     return out
 
 
+def _column_x_ranges(table) -> Dict[int, tuple]:
+    """Left/right extent of every column of a Docling table."""
+    spans: Dict[int, list] = {}
+    for c in getattr(getattr(table, "data", None), "table_cells", []) or []:
+        if c.bbox is None:
+            continue
+        i = c.start_col_offset_idx
+        cur = spans.setdefault(i, [c.bbox.l, c.bbox.r])
+        cur[0] = min(cur[0], c.bbox.l)
+        cur[1] = max(cur[1], c.bbox.r)
+    return {i: (v[0], v[1]) for i, v in spans.items()}
+
+
+def _header_by_x_overlap(body_table, header_table, n_cols: int):
+    """Column names taken from a header-only table by HORIZONTAL POSITION.
+
+    The existing recovery matches a header to a body by counting columns, and
+    silently gives up when the counts differ. They differ constantly: page 6
+    of this tender carries the header as a 4-column table
+    ('Evaluat ion Item/Category', 'Consignee /Reporting Officer',
+    'Consignee Address', 'Q ua nti') while the body on page 7 has 5 columns,
+    because Docling merged the two leftmost header cells. So the real names
+    were sitting in the document and were thrown away, and every export came
+    out as col_0..col_4 — which the model then "fixed" by inventing names.
+
+    Position does not care about counts. Each header cell is assigned to the
+    body column it overlaps most, which puts 'Schedu'/'les' (x 46-84) on the
+    body's first column (x 41-78) and 'Evaluat ion Item/Category' (x 46-166)
+    on its second (x 91-346), exactly as the page is laid out. Several cells
+    landing on one column are the wrapped lines of one label and are rejoined
+    in row order — a fragment starting lower-case continues the word above it
+    ('Schedu' + 'les' -> 'Schedules'), anything else is a new word.
+    """
+    header_cells = [c for c in
+                    (getattr(getattr(header_table, "data", None), "table_cells", []) or [])
+                    if c.bbox is not None and (c.text or "").strip()]
+    body_spans = _column_x_ranges(body_table)
+    if not header_cells or len(body_spans) < n_cols:
+        return None
+
+    buckets: Dict[int, list] = {}
+    for cell in header_cells:
+        best_col, best_overlap = None, 0.0
+        for i in range(n_cols):
+            lo, hi = body_spans.get(i, (0, 0))
+            overlap = min(cell.bbox.r, hi) - max(cell.bbox.l, lo)
+            if overlap > best_overlap:
+                best_col, best_overlap = i, overlap
+        if best_col is not None:
+            buckets.setdefault(best_col, []).append(cell)
+
+    if len(buckets) < n_cols:
+        return None
+
+    names = []
+    for i in range(n_cols):
+        parts = sorted(buckets[i], key=lambda c: (c.start_row_offset_idx,
+                                                  c.bbox.t))
+        text = ""
+        for part in parts:
+            piece = (part.text or "").strip()
+            if not piece:
+                continue
+            if not text:
+                text = piece
+            elif piece[:1].islower():
+                text += piece          # wrapped word: Schedu + les
+            else:
+                text += " " + piece
+        names.append(_repair_split_words(text) if text else f"col_{i}")
+    return names
+
+
 def _recover_header(df: pd.DataFrame, page, candidates: Dict[int, List[List[str]]],
                     file_id: str = None, table=None) -> pd.DataFrame:
     """Give a headerless table (col_0, col_1, …) the real column names taken
@@ -252,6 +325,30 @@ def _recover_header(df: pd.DataFrame, page, candidates: Dict[int, List[List[str]
     if page is None or not _columns_are_generic(df.columns):
         return df
     n = df.shape[1]
+
+    # Position first: it recovers names the count-based match below throws
+    # away whenever Docling merges or splits a header cell, which is the
+    # normal case rather than the exception.
+    if table is not None and file_id:
+        doc = state.DOCLING_DOCS.get(file_id)
+        for p in (page, page - 1):
+            for other in (doc.tables if doc is not None else []):
+                if not (other.prov and other.prov[0].page_no == p):
+                    continue
+                if other is table:
+                    continue
+                try:
+                    if not _is_header_only_table(other.export_to_dataframe(doc)):
+                        continue
+                except Exception:
+                    continue
+                names = _header_by_x_overlap(table, other, n)
+                if names:
+                    df = df.copy()
+                    df.columns = dedupe_columns(names)
+                    df.attrs["header_recovered_from_page"] = p
+                    return df
+
     for p in (page, page - 1):
         for header in candidates.get(p, []):
             if len(header) == n:
@@ -319,6 +416,7 @@ def get_all_real_tables(file_id: str, min_cols: int = 3, min_rows: int = 1) -> L
         df.columns = dedupe_columns(df.columns)
         if df.shape[1] >= min_cols and df.shape[0] >= min_rows and looks_like_real_table(df):
             page = t.prov[0].page_no if t.prov else None
+            df = _expand_merged_label_column(t, df)
             df = _recover_header(df, page, header_candidates, file_id, t)
             df.attrs["page"] = page
             dfs.append(df)
@@ -331,6 +429,167 @@ def get_all_real_tables(file_id: str, min_cols: int = 3, min_rows: int = 1) -> L
                 continue
             dfs.append(df)
     return dfs
+
+
+def _expand_merged_label_column(table, df: pd.DataFrame) -> pd.DataFrame:
+    """Repeat a merged group-label down every row it actually spans.
+
+    A vertically-merged label cell ("Globe Valve" covering twelve size rows)
+    is NOT reported by Docling as a span — every cell comes back with
+    row_span=1. Worse, the label's wrapped lines are emitted as SEPARATE
+    one-row cells at whatever grid rows their text happens to sit on, so
+    "Globe Valve" arrived as 'Globe' on row 7 and 'Valve' on row 8 with the
+    twelve rows it covers left blank. The user sees a bucket column that is
+    empty almost everywhere and split across two rows.
+
+    A plain forward-fill is the wrong repair and was rejected three times:
+    it stamps the last seen label onto every following blank, which put
+    "Globe Valve" on rows the document lists as Gate, Swing Check and Ball.
+
+    What IS recoverable is geometry. A merged cell centres its text
+    vertically, so for the run of rows [s..e] that the label really covers,
+    (top[s] + bottom[e]) / 2 lands on the text's own centre. Each label is
+    therefore given the LARGEST run of rows that
+      * contains the rows its own text overlaps,
+      * does not reach into a neighbouring label's text rows, and
+      * still centres on that text within a fraction of a row height.
+    Rows outside every label's run are left blank for the cross-page carry
+    to resolve — they belong to a group whose label sits on another page.
+
+    Returns df unchanged when the leftmost column is not a sparse label
+    column (e.g. pages where Docling dropped it entirely, or where column 0
+    is ordinary per-row data).
+    """
+    try:
+        cells = [c for c in table.data.table_cells
+                 if c.start_col_offset_idx == 0 and (c.text or "").strip()
+                 and c.bbox is not None]
+        n_rows = len(df)
+        if not cells or n_rows < 3:
+            return df
+        # Sparse == a merged label column. A fully populated column 0 is
+        # ordinary data and must not be touched.
+        if len({c.start_row_offset_idx for c in cells}) > n_rows * 0.6:
+            return df
+
+        # Vertical extent of each grid row, measured from the OTHER columns
+        # so a missing label cell cannot distort it.
+        tops: Dict[int, float] = {}
+        bots: Dict[int, float] = {}
+        for c in table.data.table_cells:
+            if c.start_col_offset_idx == 0 or c.bbox is None:
+                continue
+            r = c.start_row_offset_idx
+            if r >= n_rows:
+                continue
+            tops[r] = min(tops.get(r, c.bbox.t), c.bbox.t)
+            bots[r] = max(bots.get(r, c.bbox.b), c.bbox.b)
+        rows = sorted(set(tops) & set(bots))
+        if len(rows) < 3:
+            return df
+        heights = sorted(bots[r] - tops[r] for r in rows)
+        row_height = heights[len(heights) // 2]
+        if row_height <= 0:
+            return df
+        tolerance = 0.4 * row_height
+
+        # Fragments are the wrapped lines of ONE label only when they are
+        # also vertically CONTIGUOUS. Grid-row adjacency alone is not enough:
+        # 'Foot Valve' (rows 0) and 'Drain Valves' (row 1) are two separate
+        # one-row groups sitting on consecutive rows, and joining them
+        # produced a bogus "Foot Valve Drain Valves" label. Consecutive lines
+        # of one wrapped label nearly touch ('Globe' ends at 398, 'Valve'
+        # starts at 399); separate labels do not (79 -> 106).
+        cells.sort(key=lambda c: c.start_row_offset_idx)
+        line_gap = 0.5 * row_height
+        groups: List[list] = []
+        for c in cells:
+            if (groups
+                    and c.start_row_offset_idx
+                    - groups[-1][-1].start_row_offset_idx <= 1
+                    and c.bbox.t - groups[-1][-1].bbox.b < line_gap):
+                groups[-1].append(c)
+            else:
+                groups.append([c])
+
+        labels = []
+        for grp in groups:
+            text = " ".join((c.text or "").strip() for c in grp).strip()
+            top = min(c.bbox.t for c in grp)
+            bot = max(c.bbox.b for c in grp)
+            covered = [r for r in rows if bots[r] > top and tops[r] < bot]
+            if not covered:
+                covered = [min(rows, key=lambda r: abs((tops[r] + bots[r]) / 2
+                                                       - (top + bot) / 2))]
+            labels.append({"text": text, "centre": (top + bot) / 2,
+                           "rows": covered})
+
+        assigned = [""] * n_rows
+        for i, lab in enumerate(labels):
+            lo = (max(labels[i - 1]["rows"]) + 1) if i else rows[0]
+            hi = (min(labels[i + 1]["rows"]) - 1) if i + 1 < len(labels) else rows[-1]
+            must_lo, must_hi = min(lab["rows"]), max(lab["rows"])
+            lo, hi = min(lo, must_lo), max(hi, must_hi)
+
+            best = None
+            for s in range(lo, must_lo + 1):
+                for e in range(must_hi, hi + 1):
+                    if s not in tops or e not in bots:
+                        continue
+                    centre = (tops[s] + bots[e]) / 2
+                    if abs(centre - lab["centre"]) > tolerance:
+                        continue
+                    size = e - s + 1
+                    if best is None or size > best[0]:
+                        best = (size, s, e)
+            if best is None:
+                best = (len(lab["rows"]), must_lo, must_hi)
+            for r in range(best[1], best[2] + 1):
+                if 0 <= r < n_rows:
+                    assigned[r] = lab["text"]
+
+        if not any(assigned):
+            return df
+        out = df.copy()
+        out.iloc[:, 0] = assigned
+        out.attrs["merged_labels_expanded"] = True
+        return out
+    except Exception:
+        # Geometry is a bonus, never a reason to lose the table.
+        return df
+
+
+def _prepend_column(df: pd.DataFrame, name, values,
+                    reference_columns) -> pd.DataFrame:
+    """Add a leading column, even when `name` is already taken.
+
+    pd.DataFrame.insert() refuses a duplicate label outright — "cannot insert
+    col_0, already exists". That is not an edge case: when Docling recovers no
+    header at all, EVERY page is named col_0..col_N, so the reference page's
+    first column name always collides with the short page's own first column.
+    Confirmed crash exporting pages 6-10 of data-file-2, whose reference page
+    has 5 generic columns and whose pages 8 and 9 have 4. The same code ran
+    fine on data-file-1 only because its headers were real words ('Sl No'),
+    which happened not to clash with 'col_0'.
+
+    The column goes in under a private placeholder that cannot collide, then
+    the frame takes the reference page's header when the widths now agree —
+    these are pages of ONE table, so sharing its header is both correct and
+    what lets assemble() line them up by name.
+    """
+    out = df.copy()
+    placeholder = "__label__"
+    while placeholder in out.columns:
+        placeholder += "_"
+    out.insert(0, placeholder, values)
+
+    if len(out.columns) == len(reference_columns):
+        out.columns = list(reference_columns)
+    else:
+        cols = list(out.columns)
+        cols[0] = name
+        out.columns = dedupe_columns(cols)
+    return out
 
 
 def _restore_dropped_labels(file_id: str, frames: List[pd.DataFrame]) -> List[pd.DataFrame]:
@@ -366,14 +625,13 @@ def _restore_dropped_labels(file_id: str, frames: List[pd.DataFrame]) -> List[pd
         page = df.attrs.get("page")
         values = solved.get(page) if solved else None
         if values is not None and len(values) == len(df):
-            df = df.copy()
             if df.shape[1] == width - 1:
-                df.insert(0, first, values)
+                df = _prepend_column(df, first, values, reference.columns)
             else:
+                df = df.copy()
                 df.iloc[:, 0] = values
         elif df.shape[1] == width - 1 and width > 1:
-            df = df.copy()
-            df.insert(0, first, [None] * len(df))
+            df = _prepend_column(df, first, [None] * len(df), reference.columns)
 
         if df.shape[1] == width and width:
             labels = df.iloc[:, 0]
@@ -420,7 +678,48 @@ def _carry_labels_over_page_breaks(frames: List[pd.DataFrame], width: int) -> Li
             if seen:
                 carry = seen[-1]
         out.append(df)
-    return out
+    return _carry_labels_backwards(out, width, blank)
+
+
+def _carry_labels_backwards(frames: List[pd.DataFrame], width: int,
+                            blank) -> List[pd.DataFrame]:
+    """Fill only the blank labels at the BOTTOM of a page, from the page after.
+
+    The mirror of the forward carry above, and needed for the same reason.
+    A merged label whose text is centred inside its cell puts that text on
+    whichever page holds the middle of the group — so when a group straddles
+    a page break its label can land on the SECOND page, leaving the tail of
+    the first page unlabelled. Confirmed: the Gate Valve group starts on the
+    last three rows of page 7 and its label sits on page 8, so those three
+    rows came out blank while every other row had its bucket filled.
+
+    Deliberately narrow, for the same reason the forward carry is: only a
+    RUN OF BLANKS THAT REACHES THE BOTTOM of a page is filled, and only from
+    the very first label on the following page. A blank above a filled cell
+    is left alone — there we have no evidence.
+    """
+    for i in range(len(frames) - 1):
+        df = frames[i]
+        nxt = frames[i + 1]
+        if not (width and df.shape[1] == width and len(df)):
+            continue
+        if not (nxt.shape[1] == width and len(nxt)):
+            continue
+        values = df.iloc[:, 0].tolist()
+        if not blank(values[-1]):
+            continue
+        following = [str(v).strip() for v in nxt.iloc[:, 0].tolist()
+                     if not blank(v)]
+        if not following:
+            continue
+        label = following[0]
+        df = df.copy()
+        for j in range(len(values) - 1, -1, -1):
+            if not blank(values[j]):
+                break
+            df.iloc[j, 0] = label
+        frames[i] = df
+    return frames
 
 
 def _solve_labels_across_pages(file_id: str, frames: List[pd.DataFrame]) -> Dict:

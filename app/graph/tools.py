@@ -641,15 +641,24 @@ def get_page_content(page_number: int, file_id: str = None) -> str:
 
 
 @tool
-def get_page_range(start_page: int, end_page: int, file_id: str = None) -> str:
+def get_page_range(start_page: int, end_page: int, file_id: str = None,
+                   question: str = None) -> str:
     """Get content from a range of pages in one call, instead of calling
     get_page_content once per page. Use when the user asks for several
     consecutive pages: 'show me pages 13 to 16', 'read pages 31-35'.
+
+    Pass `question` — what the user actually wants from these pages — so the
+    result says whether the pages hold it. Without it this tool returns a
+    wall of text with no indication of whether it answers anything, which is
+    how the same call ended up being repeated eleven times in one turn.
 
     Args:
         start_page: First page number
         end_page: Last page number (inclusive)
         file_id: Optional specific file. If None, uses the active file.
+        question: What the user is looking for on these pages, in their own
+                  words. Used to report which pages carry a table and whether
+                  the range looks complete.
     """
     repeated = _guard_repeat("get_page_range", start=start_page,
                              end=end_page, file_id=file_id)
@@ -692,6 +701,39 @@ def get_page_range(start_page: int, end_page: int, file_id: str = None) -> str:
     if missing:
         result += (f"\n\n(Pages {', '.join(map(str, missing))} had no "
                    f"extractable text and are not included above.)")
+
+    # Say which pages actually carry a TABLE and how many rows they hold, so
+    # a caller who wants to export can act on this answer instead of reading
+    # the same wall of text again. Every repeated-call loop in this project's
+    # logs began with get_page_range returning text that settled nothing.
+    if question:
+        from app.tables.helpers import get_all_real_tables
+        rows_by_page = {}
+        for frame in get_all_real_tables(target):
+            pg = frame.attrs.get("page")
+            if isinstance(pg, int) and start_page <= pg <= end_page:
+                rows_by_page[pg] = rows_by_page.get(pg, 0) + len(frame)
+        if rows_by_page:
+            total = sum(rows_by_page.values())
+            with_table = sorted(rows_by_page)
+            without = [p for p in range(start_page, end_page + 1)
+                       if p not in rows_by_page]
+            result += (f"\n\n--- for '{question[:120]}' ---\n"
+                       f"Pages holding a table: {with_table} "
+                       f"({total} rows in total"
+                       f"{'; ' + ', '.join(f'p{p}={n}' for p, n in sorted(rows_by_page.items()))}"
+                       f").")
+            if without:
+                result += (f"\nNo table on: {without} — text only, so an "
+                           f"export will not include them.")
+            result += ("\nTo export these rows call export_data with these "
+                       "page numbers; do NOT call this tool again for the "
+                       "same range.")
+        else:
+            result += (f"\n\n--- for '{question[:120]}' ---\n"
+                       f"No extractable TABLE on pages {start_page}-{end_page} "
+                       f"— this range is prose. Do not try to export a table "
+                       f"from it.")
     return result
 
 
@@ -979,61 +1021,127 @@ def query_table_data(question: str, file_id: str = None) -> str:
 
 
 @tool
-def list_uploaded_files() -> str:
-    """List all files the user has uploaded in this session.
-    Use when the user asks: 'what files do I have', 'how many files',
-    'what did I upload', 'show my documents'.
+def list_uploaded_files(session_id: str = None,
+                        all_sessions: bool = False,
+                        detail: bool = True) -> str:
+    """List the documents uploaded, newest last, with what each one is.
+
+    Reports for every file: its type, size, when it was uploaded, its
+    file_id, and how much is in it (pages for documents and images, sheets
+    for spreadsheets, table and row counts) — so a follow-up question can
+    name a file instead of guessing, and "the last file I uploaded" is
+    answerable without another tool call.
+
+    Use when the user asks 'what files do I have', 'how many files',
+    'what did I upload', 'show my documents', 'the last file'.
+
+    Args:
+        session_id: Which chat's uploads to list. Defaults to this chat.
+        all_sessions: True to list uploads from every chat, not just this
+                      one. Only for an explicit "all files everywhere".
+        detail: False for one short line per file.
     """
     import os
 
     from app.persistence import get_all_files
 
-    # Scoped to THIS chat. Documents belong to the conversation they were
-    # uploaded into, so "what did I upload" must mean this chat's documents —
-    # answering from the whole registry reports other conversations' files.
+    session = None if all_sessions else (session_id
+                                         or app_state.get_active_session_id())
+    # Scoped to THIS chat by default. Documents belong to the conversation
+    # they were uploaded into, so "what did I upload" must mean this chat's
+    # documents — answering from the whole registry reports other
+    # conversations' files.
     #
     # Read from the durable registry, not in-memory state: state is emptied by
     # every server restart, which made this tool answer "you have uploaded
     # 1 file" to a user with a hundred — and made the assistant recommend
     # re-uploading files that were still perfectly available.
-    session = app_state.get_active_session_id()
-    records = [r for r in get_all_files(session) if os.path.exists(r["path"])]
+    records = list(get_all_files(session))
+    missing = [r for r in records if r.get("path") and not os.path.exists(r["path"])]
+    records = [r for r in records if not r.get("path") or os.path.exists(r["path"])]
+
     if not records:
         if not app_state.FILE_ORDER:
-            return ("No documents have been uploaded in this chat yet. "
-                    "Documents belong to the chat they were uploaded into.")
+            where = "anywhere" if all_sessions else "in this chat"
+            return (f"No documents have been uploaded {where} yet. "
+                    f"Documents belong to the chat they were uploaded into.")
         records = [{"file_id": fid,
                     "original_filename": app_state.FILE_ORIGINAL_NAME.get(fid, fid),
                     "kind": app_state.FILE_KIND.get(fid, "unknown"),
-                    "path": ""} for fid in app_state.FILE_ORDER]
+                    "path": "", "ingested_at": None} for fid in app_state.FILE_ORDER]
 
     lines = []
     for i, r in enumerate(records, 1):
         fid = r["file_id"]
-        if fid in app_state.FILE_KIND:
-            detail = f"{len(get_all_real_tables(fid))} table(s)"
-        else:
-            # Counting tables would force a full re-parse of every file just
-            # to answer "what do I have" — report availability instead.
-            detail = "available, loads on first use"
-        lines.append(f"{i}. {r['original_filename']} — {r['kind']}, {detail}, id={fid}")
-    return (f"{len(records)} document(s) uploaded in this chat:\n"
-            + "\n".join(lines))
+        name = r["original_filename"]
+        kind = r.get("kind", "unknown")
+        ext = os.path.splitext(name)[1].lower() or "?"
+        bits = [f"{ext} ({kind})"]
+        if r.get("path") and os.path.exists(r["path"]):
+            bits.append(_human_size(os.path.getsize(r["path"])))
+        if r.get("ingested_at"):
+            bits.append(f"uploaded {_human_time(r['ingested_at'])}")
+
+        if detail:
+            # Only for files already parsed in this process. Counting tables
+            # otherwise would force a full re-parse of every document just to
+            # answer "what do I have".
+            if fid in app_state.FILE_KIND:
+                meta = app_state.FILE_META.get(fid, {})
+                doc = app_state.DOCLING_DOCS.get(fid)
+                if doc is not None:
+                    try:
+                        bits.append(f"{len(getattr(doc, 'pages', {}) or {})} page(s)")
+                    except Exception:
+                        pass
+                if meta.get("sheets"):
+                    bits.append(f"{len(meta['sheets'])} sheet(s)")
+                tables = get_all_real_tables(fid)
+                if tables:
+                    bits.append(f"{len(tables)} table(s)/"
+                                f"{sum(len(t) for t in tables)} rows")
+            else:
+                bits.append("not parsed yet — loads on first use")
+        lines.append(f"{i}. {name} — {', '.join(bits)}, id={fid}")
+
+    scope = "across all chats" if all_sessions else "in this chat"
+    out = f"{len(records)} document(s) uploaded {scope} (newest last):\n" + "\n".join(lines)
+    if records:
+        out += (f"\n\nMost recent upload: {records[-1]['original_filename']} "
+                f"(id={records[-1]['file_id']}).")
+    if missing:
+        out += ("\n\nRegistered but NO LONGER ON DISK, so they cannot be "
+                "re-read: " + ", ".join(r["original_filename"] for r in missing))
+    return out
 
 
 @tool
 def export_data(question: str, format: str = "excel",
-                filename: str = None, file_id: str = None) -> str:
+                filename: str = None, file_id: str = None,
+                columns: list = None, expect_rows: int = None) -> str:
     """Export data from uploaded files to a file.
     IMPORTANT: format must be one of: csv, excel, docx, pptx
     NEVER use 'pdf' as format — use 'excel' for spreadsheets.
     Use when the user says: 'export', 'save to', 'download', 'create a file'.
+
+    If the user named the column headings they expect, or how many rows the
+    table should have, PASS THEM as `columns` / `expect_rows`. They are
+    checked against what was actually extracted BEFORE anything is written,
+    and the export FAILS with a message instead of producing a file that
+    silently disagrees with the request. Do not put them only in `question`
+    — free text is not verified.
 
     Args:
         question: What data to export (e.g. 'the Group column from Working Sheet')
         format: Output format — 'csv', 'excel', 'docx', 'pptx'
         filename: Optional output filename
         file_id: Optional specific file to export from
+        columns: The column headings the user asked for, in order. The count
+                 must match the extracted table or the export is refused;
+                 when it matches, these names are applied.
+        expect_rows: How many data rows the user expects. A shortfall of more
+                     than 10% fails the export instead of shipping a file
+                     that is missing rows.
     """
     import os
 
@@ -1170,7 +1278,8 @@ def export_data(question: str, format: str = "excel",
         return _deterministic_page_export(
             target_files[0], pages, default_name, format,
             whole_table=bool(_WHOLE_TABLE_RE.search(intent_text)),
-            no_context=_wants_bare_table(intent_text))
+            no_context=_wants_bare_table(intent_text),
+            columns=columns, expect_rows=expect_rows)
 
     # Deterministic column-selection / row-filter / top-N / computed-column
     # handling, read from the user's own words against the file's REAL
@@ -1685,11 +1794,32 @@ def modify_export(filename: str, change: str = "", file_id: str = None) -> str:
     and wants it altered: 'add the header details to that excel', 'rename the
     first two columns', 'remove the SL no column', 'take the header off'.
 
+    NOT for reordering columns — use reorder_columns or move_column, which
+    rearrange the saved file directly.
+
     Args:
         filename: The existing output file, e.g. 'f1-123.xlsx'
         change: What to change, in the user's own words
         file_id: Optional source document, if the header must be re-read
     """
+    # Reordering through this tool destroyed a finished workbook: asked to
+    # "Reorder columns to: Yard No., Sl No, ...", modify() matched none of
+    # its known operations, fell through to re-running the export, and
+    # stamped the document header band on top — every column became
+    # 'Unnamed: N' and the model then spent twenty rename_column calls
+    # trying to rebuild the header by hand (log id ed293fe7). Refuse the
+    # operation and name the tool that does it properly.
+    lowered = (change or "").lower()
+    if any(word in lowered for word in
+           ("reorder", "re-order", "rearrange", "re-arrange", "column order",
+            "column sequence", "move the column", "put the column")):
+        return ("This tool cannot reorder columns — it re-runs the export and "
+                "will rewrite the header.\n"
+                "Use reorder_columns(filename, column_order=[...]) for a full "
+                "order, or move_column(filename, column_name, after='X') to "
+                "move one column. Both rearrange the saved file directly and "
+                "keep every column that is not named.")
+
     from app.export.modify import modify
 
     # The user's literal words first. The phrasing that failed in production
@@ -1713,42 +1843,221 @@ def _names_an_operation(text: str) -> bool:
                 or ops["context"] is not None)
 
 
+def _human_size(n) -> str:
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "unknown size"
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def _human_time(epoch) -> str:
+    import datetime
+    try:
+        dt = datetime.datetime.fromtimestamp(float(epoch))
+    except (TypeError, ValueError):
+        return "unknown"
+    delta = datetime.datetime.now() - dt
+    mins = int(delta.total_seconds() // 60)
+    if mins < 1:
+        ago = "just now"
+    elif mins < 60:
+        ago = f"{mins} min ago"
+    elif mins < 60 * 24:
+        ago = f"{mins // 60} h ago"
+    else:
+        ago = f"{mins // 1440} day(s) ago"
+    return f"{dt:%Y-%m-%d %H:%M} ({ago})"
+
+
+def _find_file(file_id: str = None, filename: str = None,
+               session_id: str = None):
+    """Locate one uploaded file by id OR by the name the user calls it.
+
+    Every lookup used to be `file_id or active file`, so naming a file the
+    user had uploaded ("give last upload file overview", "overview of
+    data-file-2.pdf") answered about whatever happened to be active.
+    Registry first, because it survives restarts; in-memory state second.
+    Returns (file_id, registry_record_or_None) or (None, None).
+    """
+    import difflib
+    import os
+
+    from app.persistence import get_all_files, get_file
+
+    session = session_id or app_state.get_active_session_id()
+    records = get_all_files(session) or get_all_files(None)
+
+    if file_id:
+        rec = get_file(file_id)
+        if rec or file_id in app_state.FILE_KIND:
+            return file_id, rec
+        filename = filename or file_id      # model passed a name as the id
+
+    if filename:
+        want = str(filename).strip().lower()
+        names = {}
+        for r in records:
+            names[str(r["original_filename"]).lower()] = r
+            names[str(r["file_id"]).lower()] = r
+        if want in names:
+            r = names[want]
+            return r["file_id"], r
+        for key, r in names.items():
+            if want in key or key in want:
+                return r["file_id"], r
+        close = difflib.get_close_matches(want, list(names), n=1, cutoff=0.6)
+        if close:
+            r = names[close[0]]
+            return r["file_id"], r
+        return None, None
+
+    # "the last file I uploaded" is the newest registered one, not whatever
+    # the session variable happens to hold.
+    active = app_state.get_active_file_id()
+    if active:
+        return active, get_file(active)
+    live = [r for r in records if os.path.exists(r["path"])]
+    if live:
+        r = live[-1]
+        return r["file_id"], r
+    return None, None
+
+
 @tool
-def get_file_overview(file_id: str = None) -> str:
-    """Get a summary/overview of an uploaded file — what it contains,
-    its structure, key information. Use when the user asks:
-    'what is this file about', 'summarize', 'overview', 'describe'.
+def get_file_overview(file_id: str = None, filename: str = None,
+                      session_id: str = None,
+                      include_preview: bool = True) -> str:
+    """Describe ONE uploaded file: what it is, when it arrived, how big it
+    is, and what is actually inside it.
+
+    Works for every kind of upload — PDF, PNG/JPG, DOCX, PPTX, XLSX, CSV,
+    TXT — and reports what that kind actually has: page count and page size
+    for documents and images, sheet names for spreadsheets, table shapes,
+    OCR'd pages, headings, and the label:value pairs from the document's own
+    letterhead.
+
+    Use when the user asks 'what is this file', 'overview', 'describe',
+    'summarize', 'file details', 'when did I upload it', 'how big is it'.
 
     Args:
-        file_id: Optional specific file. If None, summarizes the active file.
+        file_id: The file's id. If omitted, `filename` is used, and failing
+                 that the active file, and failing that the most recent
+                 upload in this chat.
+        filename: The name the user calls it ('data-file-2.pdf', 'the excel')
+                  — matched against the real uploaded names.
+        session_id: Which chat's uploads to search. Defaults to this chat.
+        include_preview: Include the first rows of the first table.
     """
-    hint = _output_file_hint(file_id)
+    import os
+
+    hint = _output_file_hint(file_id or filename)
     if hint:
         return hint
-    target = file_id or app_state.get_active_file_id()
+
+    target, record = _find_file(file_id, filename, session_id)
     if not target:
-        return "No file selected."
+        return ("No such file in this chat. Call list_uploaded_files to see "
+                "what has been uploaded before answering.")
+
+    # The file may be registered but not yet parsed into memory (server
+    # restart, or it was uploaded in an earlier session).
+    from app.graph.agent import _restore_file_if_needed
+    restore_error = _restore_file_if_needed(target)
+
+    name = (record or {}).get("original_filename") \
+        or app_state.FILE_ORIGINAL_NAME.get(target, target)
+    path = (record or {}).get("path") or ""
+    kind = (record or {}).get("kind") or app_state.FILE_KIND.get(target, "unknown")
+    ext = os.path.splitext(name)[1].lower() or "?"
     meta = app_state.FILE_META.get(target, {})
-    summary = meta.get("summary", "No summary available.")
-    name = app_state.FILE_ORIGINAL_NAME.get(target, target)
-    tables = get_all_real_tables(target)
-    sheet_info = "\n".join(
-        f"  - {t.attrs.get('page')}: {t.shape[0]} rows × {t.shape[1]} cols"
-        for t in tables[:10]
-    )
-    # Label:value pairs from the document's own letterhead/header block —
-    # Yard No., Spec No., Project — extracted at ingestion time (see
-    # app/ingestion/docling_ingest.py) precisely because they sit OUTSIDE
-    # any table and get_all_real_tables never sees them. Surfaced here so
-    # a request naming one of these (e.g. "add a Yard No. column") has a
-    # real value to read instead of the model guessing or asking the user
-    # to re-type something already in the document.
+
+    lines = [f"File: {name}", f"  file_id: {target}", f"  type: {ext} ({kind})"]
+    if path and os.path.exists(path):
+        lines.append(f"  size: {_human_size(os.path.getsize(path))}")
+        lines.append(f"  on disk: {path}")
+    elif path:
+        lines.append("  size: FILE MISSING FROM DISK — it cannot be re-read")
+    if record and record.get("ingested_at"):
+        lines.append(f"  uploaded: {_human_time(record['ingested_at'])}")
+    if record and record.get("content_hash"):
+        lines.append(f"  content hash: {record['content_hash']}")
+    if record and record.get("session_id"):
+        lines.append(f"  belongs to chat: {record['session_id']}")
+
+    # --- what this KIND of file actually has -----------------------------
+    doc = app_state.DOCLING_DOCS.get(target)
+    if doc is not None:
+        try:
+            pages = getattr(doc, "pages", {}) or {}
+            lines.append(f"  pages: {len(pages)}")
+            first = pages.get(1) or (list(pages.values())[0] if pages else None)
+            size = getattr(first, "size", None)
+            if size is not None:
+                lines.append(f"  page size: {getattr(size, 'width', '?'):.0f} x "
+                             f"{getattr(size, 'height', '?'):.0f} pt"
+                             + ("  (single page — this is an image)"
+                                if len(pages) == 1 and ext in
+                                (".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff")
+                                else ""))
+        except Exception:
+            pass
+        try:
+            lines.append(f"  pictures: {len(getattr(doc, 'pictures', []) or [])}")
+        except Exception:
+            pass
+
+    sheets = meta.get("sheets")
+    if sheets:
+        lines.append(f"  sheets ({len(sheets)}): {list(sheets)}")
+
+    toc = meta.get("toc") or []
+    if toc:
+        lines.append(f"  headings/sections: {len(toc)}")
+    ocr_pages = meta.get("ocr_pages") or []
+    if ocr_pages:
+        lines.append(f"  pages needing OCR: {len(ocr_pages)}")
+
+    tables = get_all_real_tables(target) if kind != "text" else []
+    if tables:
+        rows = sum(len(t) for t in tables)
+        lines.append(f"  tables: {len(tables)} holding {rows} rows in total")
+        by_page = []
+        for t in tables[:12]:
+            where = t.attrs.get("page")
+            by_page.append(f"    - {where}: {t.shape[0]} rows x {t.shape[1]} cols "
+                           f"{[str(c) for c in t.columns][:6]}")
+        lines.append("\n".join(by_page))
+        if len(tables) > 12:
+            lines.append(f"    ... and {len(tables) - 12} more")
+    elif kind != "text":
+        lines.append("  tables: none detected — this file is prose or an image")
+
     key_values = meta.get("key_values") or {}
-    kv_info = "\n".join(f"  - {k}: {v}" for k, v in key_values.items())
-    return (f"File: {name}\n\nSummary: {summary}"
-            + (f"\n\nSheets/Tables:\n{sheet_info}" if sheet_info else "")
-            + (f"\n\nDocument metadata (from its own header/letterhead):\n{kv_info}"
-               if kv_info else ""))
+    if key_values:
+        lines.append("  document metadata (from its own letterhead):")
+        lines.extend(f"    - {k}: {v}" for k, v in key_values.items())
+
+    summary = meta.get("summary")
+    if summary:
+        lines.append(f"\nSummary: {summary}")
+    elif restore_error:
+        lines.append(f"\nNOTE: {restore_error}")
+    else:
+        lines.append("\nSummary: not generated for this file. Its contents are "
+                     "still readable with get_page_content / query_table_data.")
+
+    if include_preview and tables:
+        try:
+            preview = tables[0].head(3).to_string(index=False, max_colwidth=28)
+            lines.append(f"\nFirst rows of its first table:\n{preview}")
+        except Exception:
+            pass
+    return "\n".join(lines)
 
 
 @tool
@@ -1909,7 +2218,7 @@ def rename_column(filename: str, old_name: str, new_name: str) -> str:
                      if f.endswith(('.xlsx', '.csv'))]
         return f"File '{filename}' not found. Available: {available}"
     ext = filename.lower().split('.')[-1]
-    df = pd.read_excel(path) if ext == 'xlsx' else pd.read_csv(path)
+    df = _read_output_frame(path)
     cols = [str(c) for c in df.columns]
 
     # Already done? Confirmed production data loss: the export step had
@@ -1949,7 +2258,7 @@ def rename_column(filename: str, old_name: str, new_name: str) -> str:
                     f"Available columns: {cols}")
     df = df.rename(columns={old_name: new_name})
     if ext == 'xlsx':
-        df.to_excel(path, index=False)
+        _save_output(df, path)
     else:
         df.to_csv(path, index=False)
     return (f"Renamed '{old_name}' -> '{new_name}' in {filename}.\n"
@@ -1992,7 +2301,7 @@ def add_column(filename: str, column_name: str,
     if not os.path.exists(path):
         return f"File '{filename}' not found in outputs/"
     ext = filename.lower().split('.')[-1]
-    df = pd.read_excel(path) if ext == 'xlsx' else pd.read_csv(path)
+    df = _read_output_frame(path)
     if column_name in df.columns:
         return (f"Column '{column_name}' already exists in {filename}.\n"
                 f"Use rename_column if you want to rename it, or choose a "
@@ -2007,12 +2316,27 @@ def add_column(filename: str, column_name: str,
                 f"'{column_name}' would produce a header with nothing under "
                 f"it. Nothing was changed. Check that the file actually "
                 f"contains the exported data before adding columns to it.")
-    if position == -1 or position >= len(df.columns):
+    # pandas' insert() rejects ANY negative loc with a bare "unbounded slice"
+    # ValueError — only -1 was special-cased here, so add_column(position=-6)
+    # crashed the tool, and because a raising tool leaves its call unanswered
+    # it poisoned the whole conversation: every later turn, including "give
+    # last upload file overview", failed with the same message.
+    # Negative positions now count from the end the way Python indexing does,
+    # and anything out of range is clamped rather than raising.
+    n_cols = len(df.columns)
+    try:
+        where = int(position)
+    except (TypeError, ValueError):
+        where = n_cols
+    if where < 0:
+        where = n_cols + 1 + where          # -1 -> last, -2 -> second last
+    where = max(0, min(where, n_cols))
+    if where >= n_cols:
         df[column_name] = value
     else:
-        df.insert(int(position), column_name, value)
+        df.insert(where, column_name, value)
     if ext == 'xlsx':
-        df.to_excel(path, index=False)
+        _save_output(df, path)
     else:
         df.to_csv(path, index=False)
     return (f"Added column '{column_name}' = '{value}' to all {len(df)} rows.\n"
@@ -2043,7 +2367,7 @@ def add_data_row(filename: str, row_data: list | dict) -> str:
         return f"File '{filename}' not found in outputs/ directory."
         
     ext = filename.lower().split('.')[-1]
-    df = pd.read_excel(path) if ext == 'xlsx' else pd.read_csv(path)
+    df = _read_output_frame(path)
     
     # Normalize to list of dicts
     if isinstance(row_data, dict):
@@ -2058,7 +2382,7 @@ def add_data_row(filename: str, row_data: list | dict) -> str:
         df = new_rows_df
         
     if ext == 'xlsx':
-        df.to_excel(path, index=False)
+        _save_output(df, path)
     else:
         df.to_csv(path, index=False)
         
@@ -2090,7 +2414,7 @@ def remove_column(filename: str, column_name: str) -> str:
                      if f.endswith(('.xlsx', '.csv'))]
         return f"File '{filename}' not found. Available: {available}"
     ext = filename.lower().split('.')[-1]
-    df = pd.read_excel(path) if ext == 'xlsx' else pd.read_csv(path)
+    df = _read_output_frame(path)
     
     # Fuzzy match: find closest column name if exact not found
     if column_name not in df.columns:
@@ -2106,7 +2430,7 @@ def remove_column(filename: str, column_name: str) -> str:
     df = df.drop(columns=[column_name])
     
     if ext == 'xlsx':
-        df.to_excel(path, index=False)
+        _save_output(df, path)
     else:
         df.to_csv(path, index=False)
     return (f"Removed column '{column_name}' from {filename}.\n"
@@ -2139,7 +2463,7 @@ def filter_rows(filename: str, conditions: str,
     if not os.path.exists(path):
         return f"File '{filename}' not found in outputs/"
     ext = filename.lower().split('.')[-1]
-    df = pd.read_excel(path) if ext == 'xlsx' else pd.read_csv(path)
+    df = _read_output_frame(path)
     original_count = len(df)
     cond_lower = conditions.lower().strip()
 
@@ -2377,7 +2701,7 @@ def handle_duplicates(
     if not os.path.exists(path):
         return f"File '{filename}' not found in outputs/"
     ext = filename.lower().split('.')[-1]
-    df = pd.read_excel(path) if ext == 'xlsx' else pd.read_csv(path)
+    df = _read_output_frame(path)
 
     dup_mask = df.duplicated(subset=subset_columns, keep=(keep if keep != "none" else False))
     dup_count = int(dup_mask.sum())
@@ -2842,7 +3166,7 @@ def calculate_totals(
     if not os.path.exists(path):
         return f"File '{filename}' not found in outputs/"
     ext = filename.lower().split('.')[-1]
-    df = pd.read_excel(path) if ext == 'xlsx' else pd.read_csv(path)
+    df = _read_output_frame(path)
 
     def _find_col(name):
         if name in df.columns:
@@ -2907,7 +3231,7 @@ def split_excel_by_column(
     if not os.path.exists(path):
         return f"File '{filename}' not found in outputs/"
     ext = filename.lower().split('.')[-1]
-    df = pd.read_excel(path) if ext == 'xlsx' else pd.read_csv(path)
+    df = _read_output_frame(path)
 
     if split_column not in df.columns:
         close = difflib.get_close_matches(split_column, [str(c) for c in df.columns],
@@ -2961,7 +3285,7 @@ def pivot_table(
     if not os.path.exists(path):
         return f"File '{filename}' not found in outputs/"
     ext = filename.lower().split('.')[-1]
-    df = pd.read_excel(path) if ext == 'xlsx' else pd.read_csv(path)
+    df = _read_output_frame(path)
 
     def _fc(name):
         if name and name not in df.columns:
@@ -3093,7 +3417,7 @@ def validate_data(
     if not os.path.exists(path):
         return f"File '{filename}' not found in outputs/"
     ext = filename.lower().split('.')[-1]
-    df = pd.read_excel(path) if ext == 'xlsx' else pd.read_csv(path)
+    df = _read_output_frame(path)
 
     issues = []
 
@@ -3411,8 +3735,16 @@ def smart_extract_to_template(
 # VALVE", "## 9.2 Testing". The code is captured separately from the title so
 # sections can be grouped into a series (all "A.n") and sorted numerically —
 # "A.10" must sort after "A.9", which plain string sorting gets wrong.
+#
+# Deliberately broader than "A.n": an optional short alpha prefix, an optional
+# '-' or '.' separator, then a dotted number of any depth. That covers "A.1",
+# "9.2", "B-3", "1." and "4.2.1" without knowing anything about this
+# document's numbering style. WHICH series is the repeated per-item block is
+# then decided by counting (largest series wins), never by assuming a naming
+# convention, so a document numbering its items 1..N, or C-1..C-20, works the
+# same way with no code change.
 _SECTION_HEADING_RE = re.compile(
-    r'^#{1,6}\s*([A-Za-z]{1,3}\.\d+|\d+\.\d+)\.?[\s ]+(\S.*?)\s*$', re.M)
+    r'^#{1,6}\s*([A-Za-z]{0,3}[-.]?\d+(?:\.\d+)*)\.?[\s:]+(\S.*?)\s*$', re.M)
 
 
 def _section_sort_key(code: str):
@@ -3439,7 +3771,7 @@ def _find_sections(target: str, n_pages: int):
     return found
 
 
-def _band_labels(grids) -> set:
+def _band_labels(grids) -> dict:
     """Row-group labels ("Material", "Dimensions") that Docling sometimes
     fuses onto the front of a real attribute name, e.g. "Material Bonnet".
 
@@ -3456,6 +3788,10 @@ def _band_labels(grids) -> set:
     every section's "Hydraulic Test" attribute to "Test"; and "End
     connection" was learned the same way and ate its own column. Derived
     from the document, never hardcoded.
+
+    Returns {band: how many tables it bands}, because how WIDELY a band
+    recurs is what decides whether stripping it is safe (see
+    _merge_band_prefixed_keys).
     """
     from collections import defaultdict
     seen: dict = defaultdict(set)
@@ -3465,30 +3801,47 @@ def _band_labels(grids) -> set:
         for row in grid:
             if len(row) >= 3 and row[0] and row[1] and row[-1]:
                 seen[row[0]].add(i)
-    return {label for label, tables in seen.items() if len(tables) >= 2}
+    return {label: len(tables) for label, tables in seen.items()
+            if len(tables) >= 2}
 
 
-def _merge_band_prefixed_keys(records: list, bands: set) -> list:
+def _merge_band_prefixed_keys(records: list, bands: dict) -> list:
     """Fold "Material Bonnet" into "Bonnet" — but only where the evidence
     says that is a merge rather than a rename.
 
-    Stripping a band prefix unconditionally is wrong: "Design Pressure"
-    appears in 9 sections and bare "Pressure" in 1, so stripping "Design"
-    would rename the well-populated column to the name of a scrap one. The
-    prefix is only removed when the remainder is ALREADY a more common key
-    across the series, which is exactly the case where removing it unifies
-    two spellings of one attribute into a single column instead of
-    inventing a new one.
+    Stripping every band prefix would be wrong: "Design Pressure" appears in
+    9 sections and bare "Pressure" in 1, so stripping "Design" renames a
+    well-populated column to the name of a scrap one. Keeping every prefix is
+    equally wrong: the user asked for the Bonnet column and there wasn't one,
+    because it was only ever spelled "Material Bonnet".
+
+    Two independent pieces of evidence justify stripping, and either suffices:
+
+      1. The remainder is ALREADY a more common key in the series, so
+         removing the prefix unifies two spellings of one attribute into one
+         column. ("Dimensions Face to Face distance" x6 vs
+         "Face to Face distance" x7.)
+
+      2. The band bands MORE tables than the compound key appears in, so the
+         word is overwhelmingly a spanning label that leaked rather than part
+         of the attribute's real name. ("Material" bands 7 tables while
+         "Material Bonnet" appears in 2 -> strip. "Design" bands 2 tables
+         while "Design Pressure" appears in 9 -> keep.)
+
+    Both tests are counts taken from this document; nothing about valves,
+    bonnets or materials is encoded here, so a different document with a
+    different banding style is measured the same way.
     """
     from collections import Counter
     freq = Counter(k for rec in records for k, v in rec.items() if v)
 
     renames = {}
     for key in freq:
-        for band in bands:
+        for band, band_tables in bands.items():
             if key != band and key.startswith(band + " "):
                 rest = key[len(band):].strip()
-                if rest and freq.get(rest, 0) > freq[key]:
+                if rest and (freq.get(rest, 0) > freq[key]
+                             or band_tables > freq[key]):
                     renames[key] = rest
                 break
     if not renames:
@@ -3581,7 +3934,8 @@ def export_document_sections(output_filename: str = "sections.xlsx",
                              section_prefix: str = None,
                              start_page: int = None,
                              end_page: int = None,
-                             file_id: str = None) -> str:
+                             file_id: str = None,
+                             header_color: str = None) -> str:
     """Export EVERY repeated numbered section of a document to one Excel row
     per section — the right tool when a document repeats the same layout for
     many items, one item per page, and the user wants all of them at once.
@@ -3603,6 +3957,8 @@ def export_document_sections(output_filename: str = "sections.xlsx",
         start_page: Optional first page to look at
         end_page: Optional last page to look at
         file_id: Optional specific file. If None, uses the active file.
+        header_color: Hex fill for the header row, e.g. '1F4E79'. Default is
+                      no fill — plain bold headers.
     """
     import openpyxl
     from openpyxl.styles import Alignment, Font, PatternFill
@@ -3638,14 +3994,35 @@ def export_document_sections(output_filename: str = "sections.xlsx",
     for sec in sections:
         by_prefix.setdefault(sec["code"].rpartition(".")[0], []).append(sec)
 
+    # One row per section code. A code that appears twice is a numbering
+    # restart or a cross-reference, not a second item, and would otherwise
+    # produce duplicate rows.
+    def _unique(sections):
+        seen, out = set(), []
+        for sec in sections:
+            if sec["code"] not in seen:
+                seen.add(sec["code"])
+                out.append(sec)
+        return out
+
+    by_prefix = {k: _unique(v) for k, v in by_prefix.items()}
+
     if section_prefix:
         wanted = section_prefix.strip().rstrip(".")
         chosen = by_prefix.get(wanted)
         if not chosen:
             return (f"No sections starting with '{wanted}' in '{target}'. "
                     f"Series present: "
-                    f"{', '.join(f'{k}.n ({len(v)})' for k, v in by_prefix.items())}")
+                    f"{', '.join(f'{k or 0}.n ({len(v)})' for k, v in by_prefix.items())}")
     else:
+        # Largest series by DISTINCT codes. Counting raw headings instead
+        # picked the wrong series on this document: its top-level numbering
+        # ("1. ITEM AND QUANTITY REQUIRED", "9. TECHNICAL SPECIFICATIONS")
+        # yielded 28 headings but only 12 distinct codes because the
+        # numbering restarts in later annexures, which beat the real
+        # per-item block A.1-A.18 (18 headings, 18 distinct). A genuine
+        # enumeration does not repeat itself, so distinctness is what
+        # separates a real item series from repeated boilerplate.
         chosen = max(by_prefix.values(), key=len)
 
     if start_page is not None:
@@ -3730,9 +4107,16 @@ def export_document_sections(output_filename: str = "sections.xlsx",
     ws = wb.active
     ws.title = "Sections"
     ws.append(columns)
+    # Bold header, no fill by default. The dark-blue banner was applied
+    # unconditionally and is not wanted on a sheet that is going to be
+    # processed further — pass header_color='1F4E79' (or any hex) to get it
+    # back, or use style_excel afterwards for full control.
     for cell in ws[1]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill(fill_type="solid", fgColor="1F4E79")
+        cell.font = Font(bold=True,
+                         color="FFFFFF" if header_color else "000000")
+        if header_color:
+            cell.fill = PatternFill(fill_type="solid",
+                                    fgColor=str(header_color).lstrip("#"))
         cell.alignment = Alignment(vertical="center", wrap_text=True)
     for record in rows:
         ws.append([record.get(c, "") for c in columns])
@@ -3777,6 +4161,76 @@ def export_document_sections(output_filename: str = "sections.xlsx",
         msg += (f"\nNo table data found for: {', '.join(empty_sections)} — "
                 f"these rows have the heading only.")
     return msg
+
+
+def _read_output_frame(path: str):
+    """Read an exported workbook starting at its REAL header row.
+
+    Exports can carry a context band — merged rows above the header naming
+    the tender, the source document and the pages. pd.read_excel(path) takes
+    row 1 as the header, so on a banded file every editing tool used a band
+    line as its column names and then wrote the sheet back under them. That
+    is how exp-01.xlsx ended up with two stacked header rows: the previous
+    edit's names on top, then "Source: ... pages 7-10", then the real
+    col_0..col_4 header sitting in the data. Each further edit added another
+    layer.
+
+    band_offset() already knows where the header is — verify_export has used
+    it all along — so every reader agrees with the verifier now. The band
+    itself is kept on df.attrs so _save_output can put it back unchanged.
+    """
+    import pandas as pd
+
+    if path.lower().endswith(".csv"):
+        return pd.read_csv(path)
+
+    from app.export.exporters import band_offset
+    sheet = pd.ExcelFile(path).sheet_names[0]
+    offset = band_offset(path, sheet)
+    df = pd.read_excel(path, sheet_name=sheet, skiprows=offset)
+    band = []
+    if offset:
+        probe = pd.read_excel(path, sheet_name=sheet, header=None, nrows=offset)
+        band = [[v for v in row if pd.notna(v)] for row in probe.values.tolist()]
+    df.attrs["_band"] = band
+    df.attrs["_sheet"] = sheet
+    return df
+
+
+def _save_output(df, path: str) -> str:
+    """Write a frame back, re-emitting any context band above the header."""
+    import pandas as pd  # noqa: F401
+
+    if path.lower().endswith(".csv"):
+        df.to_csv(path, index=False)
+        return "csv"
+
+    band = df.attrs.get("_band") or []
+    sheet = df.attrs.get("_sheet") or "Sheet1"
+    if not band:
+        df.to_excel(path, index=False, sheet_name=str(sheet)[:31])
+        return "excel"
+
+    import openpyxl
+    from openpyxl.styles import Font
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = str(sheet)[:31]
+    width = max(1, len(df.columns))
+    for line in band:
+        ws.append(list(line))
+        if len(line) == 1 and width > 1:
+            ws.merge_cells(start_row=ws.max_row, start_column=1,
+                           end_row=ws.max_row, end_column=width)
+        ws.cell(ws.max_row, 1).font = Font(bold=True)
+    ws.append([str(c) for c in df.columns])
+    for cell in ws[ws.max_row]:
+        cell.font = Font(bold=True)
+    for record in df.itertuples(index=False):
+        ws.append(list(record))
+    wb.save(path)
+    return "excel"
 
 
 def _resolve_workbook(filename: str):
@@ -4033,3 +4487,158 @@ def inspect_output_file(filename: str, max_rows: int = 5) -> str:
         parts.append(df.head(max(1, max_rows)).to_string(index=False,
                                                          max_colwidth=30))
     return "\n".join(parts)
+
+
+def _resolve_column(name, columns) -> Optional[str]:
+    """Match a user-typed column name to a real one: exact, then
+    case/space-insensitive, then close spelling."""
+    import difflib
+    names = [str(c) for c in columns]
+    wanted = str(name).strip()
+    if wanted in names:
+        return wanted
+    folded = {c.strip().casefold(): c for c in names}
+    if wanted.casefold() in folded:
+        return folded[wanted.casefold()]
+    close = difflib.get_close_matches(wanted, names, n=1, cutoff=0.85)
+    return close[0] if close else None
+
+
+def _save_frame(df, out_path: str):
+    import pandas as pd  # noqa: F401 -- kept for symmetry with the readers
+    if out_path.lower().endswith(".csv"):
+        df.to_csv(out_path, index=False)
+        return "csv"
+    df.to_excel(out_path, index=False)
+    return "excel"
+
+
+def _read_frame(path: str):
+    import pandas as pd
+    return (pd.read_csv(path) if path.lower().endswith(".csv")
+            else pd.read_excel(path))
+
+
+@tool
+def reorder_columns(filename: str, column_order: list,
+                    output_filename: str = None) -> str:
+    """Put an exported file's columns into a specific left-to-right order.
+
+    Use for "rearrange the columns", "put Spec No. first", "I want this
+    column order: ...". Columns you DON'T name keep their current relative
+    order and follow the ones you did name — nothing is ever dropped, so a
+    partial list is fine and safe.
+
+    Do NOT use modify_export to reorder columns; it re-runs the export and
+    can rewrite the header.
+
+    Args:
+        filename: Exported file in outputs/, e.g. 'w2-99_enriched.xlsx'
+        column_order: Columns in the order you want them, e.g.
+                      ['Sl No', 'Tag No', 'Yard No.']
+        output_filename: Save as this name (default: overwrites)
+    """
+    from app.config import OUTPUT_DIR
+    from app.export.exporters import verify_export
+
+    path = _resolve_workbook(filename)
+    if not path:
+        return f"'{filename}' not found in outputs/."
+    if not column_order:
+        return ("column_order is empty — name at least one column, e.g. "
+                "['Spec No.', 'Tag No'].")
+
+    df = _read_frame(path)
+    ordered, unknown = [], []
+    for wanted in column_order:
+        real = _resolve_column(wanted, df.columns)
+        if real is None:
+            unknown.append(str(wanted))
+        elif real not in ordered:
+            ordered.append(real)
+
+    # Everything not named keeps its existing relative order at the end.
+    # Silently dropping unnamed columns would destroy data the user never
+    # asked to lose.
+    rest = [c for c in df.columns if c not in ordered]
+    df = df[ordered + rest]
+
+    out_name = output_filename or os.path.basename(path)
+    out_path = os.path.join(OUTPUT_DIR, out_name)
+    fmt = _save_frame(df, out_path)
+    ok, verdict = verify_export(out_path, len(df), fmt, skiprows=0)
+    if not ok:
+        return f"FAILED to write {out_name} — {verdict}."
+
+    msg = (f"{verdict}\nColumn order is now: {[str(c) for c in df.columns]}\n"
+           f"Download this exact filename: {out_name}")
+    if unknown:
+        msg += (f"\nNot found, so left where they were: {unknown}. "
+                f"Available columns: {[str(c) for c in df.columns]}")
+    if rest:
+        msg += f"\nKept after the ones you named: {[str(c) for c in rest]}"
+    return msg
+
+
+@tool
+def move_column(filename: str, column_name: str, after: str = None,
+                before: str = None, position: int = None,
+                output_filename: str = None) -> str:
+    """Move ONE column to a new place, relative to another column.
+
+    Use for "put Yard No. after Tag No", "move Spec No. to the front",
+    "move Qty to the end". Every other column keeps its order.
+
+    Args:
+        filename: Exported file in outputs/
+        column_name: The column to move, e.g. 'Yard No.'
+        after: Place it immediately after this column, e.g. 'Tag No'
+        before: Place it immediately before this column
+        position: Or a 0-based index (0 = first). Use -1 for last.
+        output_filename: Save as this name (default: overwrites)
+    """
+    from app.config import OUTPUT_DIR
+    from app.export.exporters import verify_export
+
+    path = _resolve_workbook(filename)
+    if not path:
+        return f"'{filename}' not found in outputs/."
+
+    df = _read_frame(path)
+    target = _resolve_column(column_name, df.columns)
+    if target is None:
+        return (f"No column '{column_name}' in {os.path.basename(path)}. "
+                f"Columns: {[str(c) for c in df.columns]}")
+
+    cols = [c for c in df.columns if c != target]
+
+    if after is not None:
+        anchor = _resolve_column(after, cols)
+        if anchor is None:
+            return (f"No column '{after}' to place it after. "
+                    f"Columns: {[str(c) for c in df.columns]}")
+        idx = cols.index(anchor) + 1
+    elif before is not None:
+        anchor = _resolve_column(before, cols)
+        if anchor is None:
+            return (f"No column '{before}' to place it before. "
+                    f"Columns: {[str(c) for c in df.columns]}")
+        idx = cols.index(anchor)
+    elif position is not None:
+        idx = len(cols) if int(position) < 0 else min(int(position), len(cols))
+    else:
+        return ("Say where to move it: after='Tag No', before='Spec No.', "
+                "or position=0 for first / -1 for last.")
+
+    cols.insert(idx, target)
+    df = df[cols]
+
+    out_name = output_filename or os.path.basename(path)
+    out_path = os.path.join(OUTPUT_DIR, out_name)
+    fmt = _save_frame(df, out_path)
+    ok, verdict = verify_export(out_path, len(df), fmt, skiprows=0)
+    if not ok:
+        return f"FAILED to write {out_name} — {verdict}."
+    return (f"{verdict}\nMoved '{target}'. Column order is now: "
+            f"{[str(c) for c in df.columns]}\n"
+            f"Download this exact filename: {out_name}")

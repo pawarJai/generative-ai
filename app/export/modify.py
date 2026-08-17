@@ -63,8 +63,14 @@ _CONTEXT_WORDS = re.compile(
     r"\b(header|letterhead|top section|title block|company name|company|"
     r"project|spec (?:no|number)|context|document detail|header detail|"
     r"header section|meta ?data)\b", re.IGNORECASE)
+# Deliberately no "also": it is a discourse connective, not a request to
+# include anything, and it sat closer to "header" than the negation did in
+# "do it WITHOUT header ALSO like do not repeat two time column header" — so
+# a message whose whole point was to suppress the band was read as asking for
+# it, and the band was written (log id 830933fa). Every other word here names
+# an actual act of inclusion.
 _ADD_WORDS = re.compile(
-    r"\b(add|include|put|insert|append|need|want|keep|with|also)\b", re.IGNORECASE)
+    r"\b(add|include|put|insert|append|need|want|keep|with)\b", re.IGNORECASE)
 # Deliberately no bare "no": the column heading "Spec No." made every rename
 # of it read as an instruction to strip the header band.
 _REMOVE_WORDS = re.compile(

@@ -16,7 +16,7 @@ from typing import Dict, List, Optional
 from langchain_core.messages import SystemMessage, ToolMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.errors import GraphRecursionError
-from langgraph.prebuilt import create_react_agent
+from langgraph.prebuilt import ToolNode, create_react_agent
 
 # Real-world tools for general-knowledge questions that need LIVE data —
 # already implemented and tested in the legacy agent (app/agent/tools.py's
@@ -49,6 +49,7 @@ from app.graph.tools import (
     handle_duplicates,
     inspect_output_file,
     list_sheets,
+    move_column,
     lookup_and_add_columns,
     list_uploaded_files,
     merge_files_side_by_side,
@@ -58,6 +59,7 @@ from app.graph.tools import (
     query_table_data,
     rename_column,
     remove_column,
+    reorder_columns,
     add_data_row,
     search_by_keyword,
     search_documents,
@@ -90,7 +92,7 @@ _EXPORT_TOOL_NAMES = {"export_data", "generate_quotation", "modify_export",
                       # as "**No file was created.**" purely for being absent
                       # from this set.
                       "export_document_sections", "smart_extract_to_template",
-                      "lookup_and_add_columns"}
+                      "lookup_and_add_columns", "reorder_columns", "move_column"}
 _FABRICATED_FILENAME_RE = re.compile(r"\.(xlsx|csv|docx|pptx|pdf)\b", re.IGNORECASE)
 _SUCCESS_PHRASE_RE = re.compile(
     r"\b(file\s+is\s+ready|ready\s+for\s+download|download\s+ready|"
@@ -225,7 +227,13 @@ def _asks_for_a_file(prompt: str, fallback_filename: Optional[str] = None) -> bo
 # exported 27 rows of a 64-row table, and read "page 3, 5 and 9" as pages 3
 # and 5. Nothing here is specific to a phrasing: an anchor, optional filler
 # words, and a separated list of numbers.
-_PAGE_ANCHOR_RE = re.compile(r"\bpages?\b", re.IGNORECASE)
+# "pagenumber 6,7,8,9,10" is one word, so a bare \bpages?\b never matched it
+# and the whole request fell through to the LLM sandbox, which answered that
+# page 6 "does not exist" and wrote nothing — while the same request spelled
+# "page number 6,7,8,9,10" exported 64 rows. The words a user runs together
+# ("pagenumber", "pageno") and the short forms ("pg") are the anchor too.
+_PAGE_ANCHOR_RE = re.compile(
+    r"\b(?:pages?|pgs?)(?:\s*(?:numbers?|nos?\.?|num))?\b", re.IGNORECASE)
 _PAGE_FILLER = (r"(?:number|numbers|no\.?|num|like|such\s+as|from|"
                 r"starting(?:\s+at)?|is|are|:|=)")
 _PAGE_SEP = (r"(?:,|&|\band\b|\bor\b|\bto\b|-|–|\bthrough\b|\buntil\b|"
@@ -646,13 +654,23 @@ def _wants_bare_table(prompt: str) -> bool:
     said about it. "if i need header than i will tell but right now i don't
     need" is a standing instruction: the band came back on the very next
     export, which is the third time the same complaint was filed.
+
+    The DEFAULT is now bare — a plain table, no band — and the band is added
+    only when it is actually asked for. It used to be the other way round,
+    and every export therefore opened with rows the user had not requested,
+    pushing the real header down to row 4 and putting a section title above a
+    table it does not belong to ("TReDS Payment Details" over the valve
+    schedule, because the nearest heading above the table is not necessarily
+    the table's own). "i don't need header" was filed five separate times
+    against the same default. A band is easy to ask for and was not being
+    asked for.
     """
     from app.export.modify import parse_instruction
     stated = parse_instruction(prompt or "").get("context")
     if stated is None:
         from app import state as app_state
         remembered = app_state.get_band_preference(app_state.get_active_session_id())
-        return remembered is False
+        return remembered is not True
     return stated is False
 
 
@@ -688,7 +706,9 @@ def _apply_rename_drop_ops(df, prompt: Optional[str]):
 
 def _deterministic_page_export(file_id: str, pages: list, out_filename: str,
                                out_format: str, whole_table: bool = False,
-                               no_context: bool = False) -> str:
+                               no_context: bool = False,
+                               columns: list = None,
+                               expect_rows: int = None) -> str:
     """Bypasses the code-exec LLM sandbox entirely for the single
     highest-frequency failure pattern in this whole project: "export page
     N and M". The sandbox's LLM has twice — in real production turns, not
@@ -745,6 +765,42 @@ def _deterministic_page_export(file_id: str, pages: list, out_filename: str,
     # reported as "65 rows, 5 columns, export complete", and was wrong.
     from app.tables.helpers import assemble_pages
     df, report, found = assemble_pages(file_id, pages)
+
+    # What the user ASKED FOR, checked against what was actually extracted,
+    # BEFORE a file exists. An export that silently disagrees with the request
+    # is worse than no export: the column names the user wanted were only ever
+    # passed as free text inside `question`, where nothing verified them, so a
+    # 5-column table came out as col_0..col_4 and the model "fixed" it by
+    # renaming one column per call — five tool calls, repeated every turn,
+    # twice ending in a step-limit timeout.
+    if df is not None and columns:
+        wanted = [str(c).strip() for c in columns if str(c).strip()]
+        if len(wanted) != df.shape[1]:
+            return (f"REFUSED — no file was written. You asked for "
+                    f"{len(wanted)} column(s) {wanted}, but the table "
+                    f"extracted from page(s) {found} of '{src}' has "
+                    f"{df.shape[1]}: {[str(c) for c in df.columns]}.\n"
+                    f"Either name exactly {df.shape[1]} columns, or drop the "
+                    f"`columns` argument to keep the document's own headings. "
+                    f"Do NOT rename them one at a time afterwards.")
+        df = df.copy()
+        df.columns = wanted
+
+    if df is not None and expect_rows:
+        try:
+            expected = int(expect_rows)
+        except (TypeError, ValueError):
+            expected = 0
+        if expected > 0 and len(df) < expected * 0.9:
+            return (f"REFUSED — no file was written. You expected about "
+                    f"{expected} row(s) but only {len(df)} were extracted "
+                    f"from page(s) {found} of '{src}'.\n"
+                    f"Pages actually used: {found}"
+                    + (f"; requested but holding no table: "
+                       f"{[p for p in pages if p not in found]}"
+                       if [p for p in pages if p not in found] else "")
+                    + ". Check the page range before exporting rather than "
+                      "shipping a short file.")
 
     all_tables = get_all_real_tables(file_id)
     missing = [p for p in pages if p not in found]
@@ -2112,6 +2168,8 @@ TOOLS = [
     merge_output_with_data,
     lookup_and_add_columns,
     inspect_output_file,
+    reorder_columns,
+    move_column,
     add_excel_dropdown,
     summarize_document,
     compare_documents,
@@ -2224,6 +2282,11 @@ You have these tools available:
   is the ONLY change in its own request, prefer rename_column / add_column / remove_column
   instead — see their docstrings for why.
 - remove_column: drop a column from an already-exported file.
+- reorder_columns / move_column: rearrange an exported file's columns —
+  "rearrange the columns", "put Yard No. after Tag No", "I want this
+  order: ...". Columns you do not name are kept, in their existing order.
+  NEVER use modify_export to reorder: it re-runs the export and rewrote a
+  finished workbook's header into 'Unnamed: 0..21'.
 - add_column: add ONE new column with a fixed value, broadcast to every
   row, to an already-exported file (e.g. an ID number or status code).
   Same reasoning as rename_column: prefer this over modify_export when
@@ -2497,6 +2560,44 @@ CHECKPOINT_DB_PATH = "./agent_checkpoints.db"
 _conn = sqlite3.connect(CHECKPOINT_DB_PATH, check_same_thread=False)
 checkpointer = SqliteSaver(_conn)
 
+
+# How many checkpoints to keep per conversation. LangGraph writes one per
+# superstep and never deletes any, so a working session accumulates thousands
+# — and because each one stores the WHOLE message list, they get bigger as
+# the chat grows. Measured on this project: 66.5 GB across 9,642 checkpoints,
+# the largest single checkpoint 18.2 MB, one session alone holding 16.6 GB.
+# Every superstep then serialises and writes ~18 MB into a 66 GB file, which
+# is why the identical prompt took 13s early in a session and 1,485s later.
+# Only the newest checkpoint is needed to resume a thread; the rest exist for
+# time-travel replay, which this app does not offer.
+_CHECKPOINTS_KEPT = 40
+
+
+def _prune_checkpoints(session_id: str, keep: int = _CHECKPOINTS_KEPT) -> None:
+    """Drop all but the newest `keep` checkpoints for one thread."""
+    if not session_id:
+        return
+    try:
+        with _conn:
+            rows = _conn.execute(
+                "SELECT checkpoint_id FROM checkpoints WHERE thread_id = ? "
+                "ORDER BY checkpoint_id DESC LIMIT -1 OFFSET ?",
+                (session_id, keep)).fetchall()
+            if not rows:
+                return
+            stale = [r[0] for r in rows]
+            marks = ",".join("?" * len(stale))
+            _conn.execute(
+                f"DELETE FROM writes WHERE thread_id = ? AND checkpoint_id IN ({marks})",
+                (session_id, *stale))
+            _conn.execute(
+                f"DELETE FROM checkpoints WHERE thread_id = ? AND checkpoint_id IN ({marks})",
+                (session_id, *stale))
+    except Exception as e:                       # noqa: BLE001
+        # Housekeeping must never fail a user's turn.
+        print(f"[_prune_checkpoints] {session_id}: {e}")
+
+
 # The model's ceiling is 262,144 tokens. The first version of this budgeted
 # 800k chars on a 4-chars-per-token assumption and STILL overflowed at 258,049
 # tokens — this content is tables, numbers and Devanagari, which tokenize
@@ -2507,6 +2608,15 @@ checkpointer = SqliteSaver(_conn)
 _MAX_HISTORY_CHARS = 240_000
 _MAX_HISTORY_MESSAGES = 40
 _MAX_TOOL_CHARS = 6_000
+# How much of an OLD tool result stays in the checkpoint. Measured on this
+# project: a 1,914-message thread holds 7.88 MB, of which 7.76 MB is tool
+# results the model never sees again — _trim_history sends it 42 messages
+# (0.03 MB). LangGraph rewrites the whole message list every superstep, so
+# that dead weight was being serialised ~40 times per turn and drove a 66 GB
+# checkpoint database. Compacting it is invisible three ways over: the model
+# already ignores these, thread_messages() only surfaces human/ai roles, and
+# the full text is kept in interaction_log.jsonl by _build_tool_calls_log.
+_STORED_TOOL_CHARS = 2_000
 
 
 def _trim_history(state: dict) -> dict:
@@ -2557,12 +2667,62 @@ def _trim_history(state: dict) -> dict:
     # rejected by the API, so drop any leading orphaned tool results.
     while trimmed and getattr(trimmed[0], "type", None) == "tool":
         trimmed.pop(0)
-    return {"llm_input_messages": system + trimmed}
+
+    # Shrink what is STORED, not just what is sent. Any tool result outside
+    # the window above is never going to be read by the model again, so only
+    # a readable head of it is kept in state. Returning a message with the
+    # same id makes the add_messages reducer REPLACE it in place, which keeps
+    # every AIMessage/ToolMessage pairing intact — nothing is deleted, so the
+    # history cannot become the orphaned-tool-call kind of broken.
+    live_ids = {getattr(m, "id", None) for m in trimmed}
+    compacted = []
+    for msg in messages:
+        if getattr(msg, "type", None) != "tool":
+            continue
+        if getattr(msg, "id", None) in live_ids or getattr(msg, "id", None) is None:
+            continue
+        content = getattr(msg, "content", "")
+        if not isinstance(content, str) or len(content) <= _STORED_TOOL_CHARS:
+            continue
+        compacted.append(msg.model_copy(update={
+            "content": content[:_STORED_TOOL_CHARS]
+            + f"\n… [{len(content) - _STORED_TOOL_CHARS} more characters not kept "
+              f"— this turn is finished; the full result is in the interaction log]"}))
+
+    update = {"llm_input_messages": system + trimmed}
+    if compacted:
+        update["messages"] = compacted
+    return update
+
+
+def _tool_error_message(exc: Exception) -> str:
+    """What a crashing tool returns to the model instead of raising.
+
+    A tool that raises is not just one failed step — it kills the whole
+    conversation. LangGraph's default handler re-raises, so the tool call
+    never gets its ToolMessage, and from then on EVERY turn on that thread
+    dies before the model is even called with "Found AIMessages with
+    tool_calls that do not have a corresponding ToolMessage". Confirmed:
+    add_column(position=-6) hit a pandas "unbounded slice", and the next two
+    unrelated turns — including "give last upload file overview" — failed
+    with that same message. The session was unusable.
+
+    Returning the error as text keeps the transcript valid and lets the model
+    correct itself, which is what it does with every other failed tool call.
+    """
+    name = type(exc).__name__
+    return (f"TOOL ERROR ({name}): {exc}\n"
+            f"The call failed and nothing was written. Do NOT repeat it "
+            f"unchanged — fix the arguments, or use a different tool. If the "
+            f"failure is about a column or a position, call "
+            f"inspect_output_file first to see what the file actually has.")
 
 
 agent = create_react_agent(
     model=llm,
-    tools=TOOLS,
+    # A ToolNode rather than the bare list, so a tool exception becomes a
+    # ToolMessage instead of an unhandled error (see _tool_error_message).
+    tools=ToolNode(TOOLS, handle_tool_errors=_tool_error_message),
     prompt=SYSTEM_PROMPT,
     checkpointer=checkpointer,
     pre_model_hook=_trim_history,
@@ -3033,6 +3193,10 @@ def run_agent(prompt: str, session_id: str = "default",
         # first check visible directly in interaction_log.jsonl instead.
         tool_calls_log = _build_tool_calls_log(turn_messages)
 
+        # Housekeeping while the turn is still ours: keep this thread's
+        # checkpoint history bounded so the next turn is not slowed by it.
+        _prune_checkpoints(session_id)
+
         # Determine which tool THIS turn used — only scan messages added
         # after n_prior_messages, not the whole persisted thread history.
         tool_used = None
@@ -3125,6 +3289,7 @@ def run_agent(prompt: str, session_id: str = "default",
         }
 
     except concurrent.futures.TimeoutError:
+        _prune_checkpoints(session_id)
         # See _AGENT_TURN_TIMEOUT_SEC's own comment: this is the aggregate
         # wall-clock cap on the whole turn, separate from recursion_limit
         # (step count) and the LLM client's own per-call timeout. The
@@ -3175,6 +3340,7 @@ def run_agent(prompt: str, session_id: str = "default",
         # raw "Something went wrong: Recursion limit of 25 reached..."
         # traceback dump instead of an honest, actionable answer.
         _repair_orphaned_tool_calls(config)
+        _prune_checkpoints(session_id)
         response_text = (
             "This request needed more steps than expected and was stopped "
             "before finishing, so nothing here can be trusted as done. Try "
