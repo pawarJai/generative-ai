@@ -74,6 +74,40 @@ def get_tables_on_page(file_id: str, page_no: int) -> List[pd.DataFrame]:
     return out
 
 
+def get_table_grids_on_page(file_id: str, page_no: int) -> List[List[List[str]]]:
+    """Raw cell grids (list of rows of cell text) for every table on a page.
+
+    Deliberately NOT export_to_dataframe(), which is lossy for the two table
+    shapes this document family actually uses:
+
+      * A vertical key/value spec table exports with integer column names and
+        the real header stranded in row 0, so the caller cannot tell a header
+        from data.
+      * A 2-row matrix table (header row + single value row, e.g. "Rating |
+        Size (NB) | Size (NB)" over "PN10 | 40 | 50") exports as an EMPTY
+        DataFrame with the values fused into de-duplicated column names
+        ("Size of the valves (NB).40"). The rows are simply gone.
+
+    The grid keeps merged-cell blanks exactly where Docling put them, which is
+    what makes the band/label/value reconstruction in
+    export_document_sections possible at all.
+    """
+    doc = state.DOCLING_DOCS.get(file_id)
+    if doc is None:
+        return []
+    out = []
+    for t in doc.tables:
+        if not (t.prov and t.prov[0].page_no == page_no):
+            continue
+        try:
+            grid = [[(c.text or "").strip() for c in row] for row in t.data.grid]
+        except Exception:
+            continue
+        if grid:
+            out.append(grid)
+    return out
+
+
 def _columns_look_like_data(columns) -> bool:
     """Docling's export_to_dataframe() always treats row 0 of the source
     table as the header. For tables with no real header row, this silently
@@ -289,8 +323,12 @@ def get_all_real_tables(file_id: str, min_cols: int = 3, min_rows: int = 1) -> L
             df.attrs["page"] = page
             dfs.append(df)
 
+    docling_pages = {df.attrs.get("page") for df in dfs if df.attrs.get("page") is not None}
+
     for df in state.TABULAR_TABLES.get(file_id, []):
         if df.shape[1] >= min_cols and df.shape[0] >= min_rows:
+            if df.attrs.get("page") in docling_pages and df.attrs.get("source") == "ocr":
+                continue
             dfs.append(df)
     return dfs
 

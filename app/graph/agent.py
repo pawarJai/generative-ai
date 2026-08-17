@@ -7,17 +7,17 @@ The agent uses tool-calling instead of intent classification:
 - Chat history is maintained automatically by LangGraph
 - State persists across turns via SQLite checkpointer
 """
-from langgraph.prebuilt import create_react_agent
-from langgraph.checkpoint.sqlite import SqliteSaver
+import concurrent.futures
+import os
+import re
+import sqlite3
+from typing import Dict, List, Optional
+
 from langchain_core.messages import SystemMessage, ToolMessage
-from app.config import llm
-from app.graph.tools import (
-    search_documents, query_table_data, list_uploaded_files,
-    export_data, get_file_overview, get_page_content, get_table_of_contents,
-    generate_quotation, analyze_past_contracts, modify_export,
-    merge_files_side_by_side, combine_columns, list_sheets,
-    create_excel_template
-)
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.errors import GraphRecursionError
+from langgraph.prebuilt import create_react_agent
+
 # Real-world tools for general-knowledge questions that need LIVE data —
 # already implemented and tested in the legacy agent (app/agent/tools.py's
 # agent_executor). Reused directly rather than duplicated: a LangChain @tool
@@ -25,11 +25,49 @@ from app.graph.tools import (
 # these, "answer general questions directly" only works for facts already
 # in the LLM's training data — anything needing live data (weather, news)
 # had no way to be answered and the model could only honestly decline.
-from app.agent.tools import web_search, get_weather, get_news, calculate
-from typing import Dict, List, Optional
-import os
-import re
-import sqlite3
+from app.agent.tools import calculate, get_news, get_weather, web_search
+from app.config import llm
+from app.graph.tools import (
+    add_column,
+    add_excel_dropdown,
+    analyze_past_contracts,
+    calculate_totals,
+    combine_columns,
+    compare_documents,
+    create_excel_template,
+    create_summary_sheet,
+    export_data,
+    export_document_sections,
+    extract_key_values,
+    fill_excel_template,
+    filter_rows,
+    generate_quotation,
+    get_file_overview,
+    get_page_content,
+    get_page_range,
+    get_table_of_contents,
+    handle_duplicates,
+    inspect_output_file,
+    list_sheets,
+    lookup_and_add_columns,
+    list_uploaded_files,
+    merge_files_side_by_side,
+    merge_output_with_data,
+    modify_export,
+    pivot_table,
+    query_table_data,
+    rename_column,
+    remove_column,
+    add_data_row,
+    search_by_keyword,
+    search_documents,
+    smart_extract_to_template,
+    split_excel_by_column,
+    style_excel,
+    summarize_document,
+    validate_data,
+    web_search_procurement,
+)
 
 # Every tool that writes a file into OUTPUT_DIR. The export backstops read
 # this set to decide whether a file really was produced this turn; a
@@ -38,7 +76,21 @@ import sqlite3
 # overwriting the side-by-side file with a vertical stack.
 _EXPORT_TOOL_NAMES = {"export_data", "generate_quotation", "modify_export",
                       "merge_files_side_by_side", "combine_columns",
-                      "create_excel_template"}
+                      "create_excel_template", "rename_column", "add_column",
+                      "remove_column", "add_data_row", "filter_rows", "fill_excel_template",
+                      "handle_duplicates", "style_excel",
+                      "merge_output_with_data", "add_excel_dropdown",
+                      "calculate_totals", "split_excel_by_column",
+                      "pivot_table", "create_summary_sheet",
+                      "compare_documents", "extract_key_values",
+                      # Anything that WRITES a file must be listed here, or
+                      # the guard below reads a truthful "I created X" as a
+                      # hallucination and overrides it. Both of these wrote
+                      # real, correct workbooks and were reported to the user
+                      # as "**No file was created.**" purely for being absent
+                      # from this set.
+                      "export_document_sections", "smart_extract_to_template",
+                      "lookup_and_add_columns"}
 _FABRICATED_FILENAME_RE = re.compile(r"\.(xlsx|csv|docx|pptx|pdf)\b", re.IGNORECASE)
 _SUCCESS_PHRASE_RE = re.compile(
     r"\b(file\s+is\s+ready|ready\s+for\s+download|download\s+ready|"
@@ -480,12 +532,13 @@ def _deterministic_sheet_export(file_id: str, sheet_name: str, out_filename: str
     reaching this function before any column filter ever got a chance to
     run, regardless of which caller invoked it.
     """
-    from app.tables.helpers import get_all_real_tables
+    import os
+
+    from app import state as app_state
+    from app.config import OUTPUT_DIR
     from app.export.exporters import EXPORTERS, verify_export
     from app.models import QueryPlan
-    from app import state as app_state
-    import os
-    from app.config import OUTPUT_DIR
+    from app.tables.helpers import get_all_real_tables
 
     src = _display_name(file_id, app_state.FILE_ORIGINAL_NAME.get(file_id) or file_id)
     tables = get_all_real_tables(file_id)
@@ -523,6 +576,8 @@ def _deterministic_sheet_export(file_id: str, sheet_name: str, out_filename: str
     if prompt:
         from app.export import spec as export_spec
         df, changes = export_spec.parse_and_apply(df, prompt)
+        df, mod_changes = _apply_rename_drop_ops(df, prompt)
+        changes = changes + mod_changes
         if changes:
             applied = f" Applied: {'; '.join(changes)}."
         if df.empty:
@@ -601,6 +656,36 @@ def _wants_bare_table(prompt: str) -> bool:
     return stated is False
 
 
+def _apply_rename_drop_ops(df, prompt: Optional[str]):
+    """A rename or drop-column request bundled into the SAME message as an
+    export, applied here rather than left to depend on a second,
+    separate modify_export tool call the model does not reliably make.
+
+    Confirmed production failure (session 7e43a023, 2026-08-14): asked to
+    export pages 31-35 AND rename a column AND add one, in one message, the
+    model called only the export tool, never called modify_export at all,
+    and then wrote prose claiming the rename had happened anyway — a file
+    on disk that still had the original, unrenamed column. Applying it
+    here, deterministically, from the same prompt the export itself already
+    reads, means the outcome no longer depends on the model choosing to
+    make a second tool call.
+
+    Deliberately excludes filter/limit/computed-column ops: those are
+    already applied by export_spec.parse_and_apply immediately before this
+    runs, and re-running them here from the same raw prompt would apply
+    them a second time.
+    """
+    if not prompt:
+        return df, []
+    from app.export.modify import apply_ops, parse_instruction
+    ops = parse_instruction(prompt)
+    ops["may_add_column"] = False
+    ops["may_reduce_rows"] = False
+    if not (ops.get("rename") or ops.get("positional_rename") or ops.get("drop")):
+        return df, []
+    return apply_ops(df, ops)
+
+
 def _deterministic_page_export(file_id: str, pages: list, out_filename: str,
                                out_format: str, whole_table: bool = False,
                                no_context: bool = False) -> str:
@@ -615,12 +700,13 @@ def _deterministic_page_export(file_id: str, pages: list, out_filename: str,
     objects directly via get_all_real_tables() — already the ground-truth
     source used elsewhere in this codebase (app/tables/helpers.py) — means
     page-to-table mapping is exact, not an LLM guess."""
-    from app.tables.helpers import get_all_real_tables
+    import os
+
+    from app import state as app_state
+    from app.config import OUTPUT_DIR
     from app.export.exporters import EXPORTERS, verify_export
     from app.models import QueryPlan
-    from app import state as app_state
-    import os
-    from app.config import OUTPUT_DIR
+    from app.tables.helpers import get_all_real_tables
 
     # Name the document in every outcome. A confirmed production export read
     # the wrong file entirely and reported "page 7 contained no extractable
@@ -682,8 +768,9 @@ def _deterministic_page_export(file_id: str, pages: list, out_filename: str,
     if prompt_text:
         from app.export import spec as export_spec
         filtered_df, changes = export_spec.parse_and_apply(df, prompt_text)
+        df, mod_changes = _apply_rename_drop_ops(filtered_df, prompt_text)
+        changes = changes + mod_changes
         if changes:
-            df = filtered_df
             applied = f" Applied: {'; '.join(changes)}."
         if df.empty:
             return (f"The requested filter matched no rows across page(s) "
@@ -1034,14 +1121,15 @@ def _deterministic_multi_export(specs: List[dict], prompt: str,
     documents in play that failure would be invisible — the wrong rows still
     look plausible next to the right ones.
     """
-    from app.tables.helpers import get_all_real_tables, _restore_dropped_labels
-    from app.tables.assembly import assemble
+    import pandas as pd
+
+    from app import state as app_state
+    from app.config import OUTPUT_DIR
     from app.export.exporters import EXPORTERS, verify_export
     from app.models import QueryPlan
     from app.persistence import get_file
-    from app import state as app_state
-    from app.config import OUTPUT_DIR
-    import pandas as pd
+    from app.tables.assembly import assemble
+    from app.tables.helpers import _restore_dropped_labels, get_all_real_tables
 
     positions = [s["pos"] for s in specs]
     sheets, notes, described = [], [], []
@@ -1450,7 +1538,7 @@ def _catch_false_missing_file_claim(response_text: str, prompt: str,
         return response_text
 
     from app.persistence import get_file
-    from app.query.semantic import semantic_fallback, has_indexed_content
+    from app.query.semantic import has_indexed_content, semantic_fallback
     from app.tables.helpers import get_all_real_tables
 
     record = get_file(file_id)
@@ -1743,6 +1831,7 @@ def _catch_wrong_file_inventory(response_text: str, prompt: str) -> str:
         return response_text
 
     import os
+
     from app import state as app_state
     from app.persistence import get_all_files
 
@@ -2007,11 +2096,36 @@ TOOLS = [
     query_table_data,
     list_uploaded_files,
     export_data,
+    export_document_sections,
     merge_files_side_by_side,
     combine_columns,
     modify_export,
+    rename_column,
+    remove_column,
+    add_column,
+    add_data_row,
+    filter_rows,
+    fill_excel_template,
+    smart_extract_to_template,
+    handle_duplicates,
+    style_excel,
+    merge_output_with_data,
+    lookup_and_add_columns,
+    inspect_output_file,
+    add_excel_dropdown,
+    summarize_document,
+    compare_documents,
+    calculate_totals,
+    split_excel_by_column,
+    pivot_table,
+    extract_key_values,
+    validate_data,
+    create_summary_sheet,
+    web_search_procurement,
     get_file_overview,
     get_page_content,
+    get_page_range,
+    search_by_keyword,
     get_table_of_contents,
     list_sheets,
     create_excel_template,
@@ -2023,7 +2137,25 @@ TOOLS = [
     calculate,
 ]
 
-SYSTEM_PROMPT = """You are ONEX AI — a private procurement intelligence
+SYSTEM_PROMPT = """CRITICAL RULE — READ BEFORE ANYTHING ELSE: You have NO
+built-in knowledge of the user's uploaded documents. You MUST call a tool
+before answering ANY question about document content — specs, valves,
+materials, quantities, standards, Tag No., Spec No., prices, page
+contents. NEVER answer such a question from training memory, and never
+from a conclusion you reached earlier in this conversation: an earlier
+turn's answer is not evidence, and if the user is asking again it is
+usually because that answer was wrong. Call the tool again. If the tools
+genuinely return nothing, say "not found in the uploaded documents" —
+never fill the gap with plausible-sounding technical detail. Confirmed
+production failure: asked repeatedly for spec A.1, the model stopped
+calling tools entirely and answered from its own earlier (incorrect)
+conclusion that the section was missing, telling the user their document
+was corrupted and to contact the supplier — while the section was
+genuinely present in the file the whole time. Inventing material grades,
+test pressures or standards that are not in the tool output is the worst
+failure this system can produce.
+
+You are ONEX AI — a private procurement intelligence
 assistant for industrial and government quotation management.
 
 You help with:
@@ -2038,11 +2170,41 @@ You have these tools available:
   which page it's on — terms, specs, descriptions written in documents
 - get_page_content: when the user names a specific page number — this
   returns the EXACT page, unlike search_documents which only guesses
+- get_page_range: several consecutive pages in one call — "show pages
+  13 to 16" — instead of calling get_page_content once per page.
+  NOT for building a spreadsheet out of many repeated sections: use
+  export_document_sections, which reads them all in one call. Reading
+  18 pages of raw text and assembling the table yourself is how turns
+  run out of steps and deliver nothing.
+- export_document_sections: EVERY repeated numbered section into one
+  Excel row each — "export all spec numbers A.1 to A.18", "put all the
+  valve specifications in one sheet", "get the details for every spec".
+  One call covers the whole series; values come straight from the
+  document's own tables, so nothing can be invented. Reach for this the
+  moment a request covers a RANGE of sections rather than one.
+- search_by_keyword: an EXACT word/phrase/code — "where does PTFE
+  appear", "find tag number 7210-V123" — like Ctrl+F, across both
+  document text and tables. Not for meaning-based questions
+  (search_documents) or a "A.1"-style spec code alone (search_documents
+  already finds those directly).
 - get_table_of_contents: for "table of contents", "what sections/chapters
   exist", "what page is X on", "indexing" — returns the real extracted
   heading list, not a guess from search results
 - query_table_data: for questions about numbers, rows, columns, data
-  in spreadsheets — filtering, counting, aggregating
+  in the UPLOADED spreadsheets — filtering, counting, aggregating. It
+  reads source documents only; it can NOT see files in outputs/.
+- inspect_output_file: to look inside a file this app already EXPORTED —
+  "what columns does spec.xlsx have", "is the data actually filled in",
+  "check the file you just made". Any question naming an .xlsx/.csv that
+  this app produced goes here, never to query_table_data.
+- lookup_and_add_columns: to ATTACH one exported file's columns onto
+  another's rows by a shared key — "map the spec number data onto my
+  valve list", "add the A.1-A.18 details to each row by Spec No.", "add
+  the user's name and address against each user id". This is a VLOOKUP:
+  rows stay put and gain columns. It finds the key columns itself even
+  when the two files name them differently ("Spec No." vs "Section").
+  Do NOT use merge_output_with_data for this — that one joins against
+  raw tables inside a PDF and cannot see a second exported file.
 - list_sheets: for the sheets/tabs of a spreadsheet — "how many sheets",
   "list the sheet names", "what tabs are in this file"
 - list_uploaded_files: when user asks what files they have uploaded
@@ -2056,8 +2218,34 @@ You have these tools available:
   columns are still filled from it automatically; this is not an
   either/or choice.
 - modify_export: when user wants to CHANGE a file that already exists —
-  add or remove the document header block above the table, rename columns,
-  drop columns. Never re-export from scratch to satisfy one of these.
+  add or remove the document header block above the table, drop columns,
+  or several such changes named loosely in one sentence. Never re-export
+  from scratch to satisfy one of these. For a rename or a new column that
+  is the ONLY change in its own request, prefer rename_column / add_column / remove_column
+  instead — see their docstrings for why.
+- remove_column: drop a column from an already-exported file.
+- add_column: add ONE new column with a fixed value, broadcast to every
+  row, to an already-exported file (e.g. an ID number or status code).
+  Same reasoning as rename_column: prefer this over modify_export when
+  adding the column is the request's own, separate ask.
+- add_data_row: add a single row of specific extracted data into a file.
+- rename_column: rename ONE column of an already-exported file, given the
+  exact old and new names. Use this over modify_export whenever a rename
+  is a distinct, isolated part of the request — especially when the same
+  message ALSO asks for an export or an added column, since each needs
+  its own tool call with its own clean arguments (see the tool's own
+  docstring for the exact production failure this avoids).
+- filter_rows: keep only matching rows of an already-exported file — 'top
+  N', 'bottom N', 'where X = Y', 'remove duplicates' — or save the result
+  under a new filename.
+- handle_duplicates: show, remove, or explicitly allow duplicate rows in
+  an already-exported file.
+- style_excel: color, bold, font, alternating rows on an already-exported
+  Excel file — always pass hex colors, never color names.
+- fill_excel_template: use ONLY when the user wants to automatically extract ALL
+  tables from the entire document and dump them into the template. Do NOT use
+  this if the user only wants to add a single specific row or specific extracted values.
+  For adding specific values, use add_data_row instead.
 - merge_files_side_by_side: to put TWO documents' columns next to each
   other in one sheet — 'side by side', 'horizontal merge', 'SQL join style'
 - combine_columns: to join two or more columns of an ALREADY EXPORTED file
@@ -2073,6 +2261,32 @@ You have these tools available:
   when the question needs up-to-date information
 - get_news: latest headlines about a topic or location
 - calculate: for arithmetic you want verified rather than computed mentally
+- merge_output_with_data: to add columns from an UPLOADED source document
+  onto a file that has ALREADY been exported — different from
+  merge_files_side_by_side, which merges two SOURCE documents into a new
+  file rather than extending an existing export
+- add_excel_dropdown: when user says add dropdown, create dropdown list,
+  limit column to values, make Rating a dropdown with PN10 PN16
+- summarize_document: when user says summarize, key points, overview,
+  executive summary, what does this tender ask for
+- compare_documents: when user says compare file 1 vs file 2,
+  what is different, which has better terms
+- calculate_totals: when user says calculate total, multiply qty by rate,
+  add GST, compute grand total, total value = quantity x unit rate
+- split_excel_by_column: when user says split by group, one file per
+  category, separate by valve type, create separate files for each X
+- pivot_table: when user says create pivot, summarize by group,
+  total by category, aggregate data, group and sum
+- extract_key_values: when user says find the yard number, extract EMD,
+  get project name, find spec number, extract all key details
+- validate_data: when user says check for errors, find missing values,
+  validate data, are there blanks, check data quality
+- create_summary_sheet: when user says add summary tab, create summary
+  sheet, add totals sheet, add a dashboard, show totals by group
+- web_search_procurement: when user asks about standards (IS/BS/EN/ASTM),
+  GeM tender details, material specifications, market prices, regulations
+  — prefer this over the general web_search for procurement/engineering
+  standards specifically
 
 Rules:
 1. ALWAYS use a tool to answer questions about uploaded files.
@@ -2108,6 +2322,31 @@ Rules:
    relevant tool's data/question parameter.
    An offer to create the file later ("let me know if you'd like...") is
    NOT acceptable when the user already told you to create it.
+   A SINGLE message routinely bundles an export request with a rename, an
+   added column, or a header request in the same sentence ("export pages
+   31-35 ... also rename Description to Group ... also add a Yard No.
+   column"). The export tool only ever exports FROM the source document —
+   it does not rename or add columns; the export tool itself already
+   applies a rename bundled into the SAME sentence deterministically, but
+   an ADDED column is not — that still needs its own follow-up call. When
+   the message asks for more than the export, call the export tool first,
+   THEN call rename_column / add_column / remove_column (never modify_export for a rename
+   or an add that is the request's own separate ask — see those tools'
+   docstrings) on the file it just wrote, in the SAME turn, before
+   answering. Confirmed production failures, both with column changes
+   silently not applied while the final answer claimed they were: (1) the
+   model called only the export tool, never called anything for the
+   rename/add-column part at all; (2) the model DID make a second call, but
+   to modify_export with a `change` argument that got silently overridden
+   by the FULL original sentence re-parsed from scratch — which still
+   contained the FIRST call's already-completed rename clause, so the
+   second call re-attempted that (found nothing to rename, since it was
+   already done) and never attempted the actual add-column instruction.
+   rename_column / add_column / remove_column take exact, structured arguments instead of
+   a re-parsed sentence, so a later call in the same turn cannot be
+   confused by an earlier call's already-applied clause. Never describe a
+   rename or an added column as done unless a tool actually returned a
+   result saying so THIS turn.
 7. If the user asks to add header details, company/project/spec information,
    or a title block to a file that already exists, call modify_export with
    that filename. That information is recovered from the source document —
@@ -2122,7 +2361,18 @@ Rules:
     returning wrong data, say exactly that — which columns/rows are wrong
     and why — do NOT invent a "manually created" file or make up data
     that looks plausible. A fabricated success is worse than an honest
-    failure.
+    failure. This does NOT mean quoting or comparing raw tool-output text
+    from more than one attempt in the same reply. Confirmed production
+    failure: asked once, the model called the same export tool twice, got
+    two different results, and answered by pasting both raw outputs back
+    to back with "I claimed one was; nothing had written it... The export
+    attempt this turn returned:" — a confusing, self-contradicting message
+    that read as a lie even though the second attempt had actually
+    succeeded. Only the LAST tool call's result reflects the file's real
+    state on disk. Report that one result, plainly, in your own words. If
+    it differs from what you said a moment ago, say what changed in one
+    plain sentence — never narrate your own retries or quote an earlier
+    attempt's output.
 12. NEVER write a download URL, and never state a file's size or row count
     from memory. The user downloads files through this app's own file list;
     a link you compose goes nowhere. Confirmed: a made-up
@@ -2318,6 +2568,107 @@ agent = create_react_agent(
     pre_model_hook=_trim_history,
 )
 
+# app.config's llm client bounds any ONE model call (timeout=90,
+# max_retries=1 -> worst case ~180s), and recursion_limit bounds how many
+# steps a turn may take — but neither bounds the TURN'S total wall-clock
+# time. Confirmed production failure: with several model-call rounds in one
+# turn and the provider degraded enough that every one of them used its
+# full retry budget, a single /chat request ran 30-45 minutes with nothing
+# in interaction_log.jsonl to show for it, because nothing had finished yet
+# to log. recursion_limit=25 permits roughly a dozen model-call rounds;
+# 12 x 180s worst case is 36 minutes — exactly the reported range.
+#
+# This wraps the whole turn in its own wall-clock deadline, independent of
+# step count or per-call retries — the invariant a chat UI actually needs
+# ("never wait more than N minutes for any answer"). Python cannot forcibly
+# stop a running thread, so on timeout the background call is abandoned
+# rather than cancelled; it may still finish later and write to this
+# thread's checkpoint. That is the same kind of interruption
+# _repair_orphaned_tool_calls already exists to clean up on the NEXT
+# message on this thread, so it is a safe trade against a request that
+# would otherwise never return at all. Sized for several concurrent chat
+# requests (this app already serves /chat via run_in_threadpool).
+# Sized from the real interaction log rather than guessed. Every turn that
+# SUCCEEDED completed in 9-176s (typical: 15-76s). Every turn that ran past
+# ~300s was a repeated-identical-tool-call loop that was never going to
+# finish — 304s and 529s both ended in "need more steps", having produced
+# nothing. So the useful cut-off sits above the slowest real success and
+# below the runaway range: 300s is ~1.7x the slowest genuine success, which
+# leaves headroom for a larger document without making a user watch a
+# spinner for ten minutes before being told it failed.
+#
+# This is a backstop for a genuinely slow LLM provider, NOT the defence
+# against loops — that is tools._guard_repeat, which stops a repeating call
+# after 3 attempts (seconds), long before either this or recursion_limit is
+# reached. A timeout alone cannot fix a loop; it only decides how long the
+# user waits to be told about it.
+_AGENT_TURN_TIMEOUT_SEC = 300
+_INVOKE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=8, thread_name_prefix="agent-invoke")
+
+
+def _invoke_with_deadline(payload: dict, config: dict):
+    def _run():
+        # Start this turn's identical-call history, keyed by session so two
+        # users asking the same question cannot block each other. Must run
+        # here, on the thread that enters the graph, so the contextvar is set
+        # for everything the invocation goes on to do.
+        from app.graph.tools import reset_repeat_guard
+        reset_repeat_guard(
+            str((config.get("configurable") or {}).get("thread_id") or ""))
+        return agent.invoke(payload, config=config)
+
+    future = _INVOKE_EXECUTOR.submit(_run)
+    return future.result(timeout=_AGENT_TURN_TIMEOUT_SEC)
+
+
+def _build_tool_calls_log(turn_messages: list) -> list:
+    """Every tool call made this turn — name, the exact arguments the model
+    actually passed, and the tool's own returned text.
+
+    Every bug fixed in this project's history so far ("called export_data
+    without file_id on retry", "the model never called modify_export at all")
+    was only ever confirmed by re-running the live server and reading the
+    exported file's bytes back by hand — this makes that first check visible
+    directly in interaction_log.jsonl instead.
+    """
+    tool_results = {
+        getattr(m, "tool_call_id", None): m.content
+        for m in turn_messages if getattr(m, "type", None) == "tool"}
+    out = []
+    for msg in turn_messages:
+        for tc in (getattr(msg, "tool_calls", None) or []):
+            result = tool_results.get(tc.get("id"))
+            out.append({
+                "tool": tc.get("name"),
+                "args": tc.get("args"),
+                "result": result[:500] if isinstance(result, str) else result,
+            })
+    return out
+
+
+def _tool_calls_from_checkpoint(config: dict, n_prior_messages: int) -> list:
+    """The turn's tool calls read back out of the persisted thread, for the
+    paths where the graph raised instead of returning.
+
+    A turn that dies on recursion_limit or the wall-clock deadline used to
+    log "tool_calls": [] — the calls only ever came off the returned result,
+    and on those paths there is no result. That blanked the trace in exactly
+    the case where it is most needed: a 115-second turn logged as
+    recursion_limit_reached with an empty tool list gives no way to see WHAT
+    it looped on, which is the only thing that identifies the fix. LangGraph
+    checkpoints per superstep, so the calls are already durably saved even
+    though the invocation never returned.
+    """
+    try:
+        snapshot = agent.get_state(config)
+        messages = list(snapshot.values.get("messages", [])) \
+            if snapshot and snapshot.values else []
+        return _build_tool_calls_log(messages[n_prior_messages:])
+    except Exception:
+        # Diagnostics must never turn a handled failure into an unhandled one.
+        return []
+
 
 def _repair_orphaned_tool_calls(config: dict) -> bool:
     """Patch a thread whose checkpoint holds an AIMessage with tool_calls
@@ -2379,8 +2730,9 @@ def run_agent(prompt: str, session_id: str = "default",
     Returns same contract as old chat():
     {"response": str, "intent": str, "file_id": str, "table": dict|None}
     """
-    from app import state as app_state
     import time
+
+    from app import state as app_state
 
     # "general_chat" is a frontend placeholder for "no document selected",
     # not a file. Passing it through made the Step 4 guard reject every
@@ -2452,7 +2804,31 @@ def run_agent(prompt: str, session_id: str = "default",
                 ],
             }
 
-    config = {"configurable": {"thread_id": session_id}}
+    # recursion_limit caps LangGraph's own step count (each model call and
+    # each tool call is one step), guarding against a runaway ReAct loop —
+    # create_react_agent has no max_iterations constructor argument in the
+    # installed LangGraph version (checked via inspect.signature; it is not
+    # in the parameter list at all — re-checked, still absent), so this is
+    # set per-invocation here instead.
+    #
+    # LangGraph counts EVERY node execution as one step, so a single
+    # tool-using round costs 2 (one model call + one tool call). 80 therefore
+    # allows ~40 tool calls in one turn. For scale: the most involved real
+    # request in the log — export a page range, rename a column, add a
+    # column, drop a column — used 5 tools (~12 steps). Chaining an export
+    # per spec section for all 18 sections would be ~40 steps. 80 is roughly
+    # double the most demanding legitimate turn seen.
+    #
+    # It was briefly 150, which is not harmful in itself but is the wrong
+    # tool for the problem it was raised to solve: the turns that exhausted
+    # the budget were repeating ONE identical call (get_page_range(13, 30)
+    # thirty-five times), and a loop consumes whatever budget it is given —
+    # 150 just meant waiting longer for the same failure. tools._guard_repeat
+    # now stops that after 3 identical calls, so this limit is back to being
+    # what it should be: a backstop against genuinely runaway branching, set
+    # low enough that hitting it is fast and informative.
+    config = {"configurable": {"thread_id": session_id},
+              "recursion_limit": 80}
 
     # How many messages exist in this thread BEFORE this turn, so we can
     # isolate what THIS turn actually did — the checkpointer returns the
@@ -2640,13 +3016,22 @@ def run_agent(prompt: str, session_id: str = "default",
     t0 = time.time()
     try:
         try:
-            result = agent.invoke({"messages": messages}, config=config)
+            result = _invoke_with_deadline({"messages": messages}, config)
         except ValueError as e:
             if "corresponding ToolMessage" not in str(e) or not _repair_orphaned_tool_calls(config):
                 raise
-            result = agent.invoke({"messages": messages}, config=config)
+            result = _invoke_with_deadline({"messages": messages}, config)
         response_text = result["messages"][-1].content
         turn_messages = result["messages"][n_prior_messages:]
+
+        # Every tool call made this turn — name, the exact arguments the
+        # model actually passed, and the tool's own returned text. Every bug
+        # fixed in this project's history so far ("called export_data
+        # without file_id on retry", "the model never called modify_export
+        # at all") was only ever confirmed by re-running the live server and
+        # reading the exported file's bytes back by hand — this makes that
+        # first check visible directly in interaction_log.jsonl instead.
+        tool_calls_log = _build_tool_calls_log(turn_messages)
 
         # Determine which tool THIS turn used — only scan messages added
         # after n_prior_messages, not the whole persisted thread history.
@@ -2719,7 +3104,8 @@ def run_agent(prompt: str, session_id: str = "default",
         )
         log_interaction(session_id, file_id, prompt, plan,
                         response_text, success=True,
-                        latency=time.time() - t0)
+                        latency=time.time() - t0,
+                        tool_calls=tool_calls_log)
         return {
             "response": response_text,
             "intent": intent,
@@ -2738,9 +3124,100 @@ def run_agent(prompt: str, session_id: str = "default",
             ],
         }
 
+    except concurrent.futures.TimeoutError:
+        # See _AGENT_TURN_TIMEOUT_SEC's own comment: this is the aggregate
+        # wall-clock cap on the whole turn, separate from recursion_limit
+        # (step count) and the LLM client's own per-call timeout. The
+        # background call is abandoned, not cancelled (Python cannot
+        # forcibly stop a running thread) — it may still finish later and
+        # write to this thread's checkpoint; that is handled the same way
+        # an interrupted tool call always is, via _repair_orphaned_tool_calls
+        # on the NEXT message on this thread.
+        response_text = (
+            f"This request took longer than {_AGENT_TURN_TIMEOUT_SEC}s and "
+            f"was abandoned, so nothing here can be trusted as done. This "
+            f"usually means the AI provider is slow or degraded right now, "
+            f"not a problem with your request — try asking again in a "
+            f"moment, or split it into smaller requests.")
+        from app.logging_utils import log_interaction
+        from app.models import QueryPlan
+        log_interaction(session_id, file_id, prompt, QueryPlan(intent="general"),
+                        response_text, success=False,
+                        error="agent_turn_timeout",
+                        latency=time.time() - t0,
+                        tool_calls=_tool_calls_from_checkpoint(
+                            config, n_prior_messages))
+        return {
+            "response": response_text,
+            "intent": "error",
+            "file_id": file_id or app_state.get_active_file_id(),
+            "table": None,
+            "available_files": [
+                {"file_id": fid,
+                 "name": app_state.FILE_ORIGINAL_NAME.get(fid, fid),
+                 "kind": app_state.FILE_KIND.get(fid, "unknown")}
+                for fid in app_state.FILE_ORDER
+            ],
+        }
+
+    except GraphRecursionError:
+        # recursion_limit exists to stop a genuinely runaway tool-calling
+        # loop rather than let it hang for minutes — but hitting it can
+        # leave the SAME corruption _repair_orphaned_tool_calls already
+        # exists to fix: the graph can stop right after a model step that
+        # requested a tool call, before the matching ToolMessage was ever
+        # appended. Left alone, the very next message on this thread hits
+        # "Found AIMessages with tool_calls that do not have a
+        # corresponding ToolMessage" instead of a clean answer — the
+        # original bug, just reached a different way. Confirmed production
+        # failure: a repair-and-retry for one orphaned get_table_of_contents
+        # call ran the full step budget without stopping and surfaced as a
+        # raw "Something went wrong: Recursion limit of 25 reached..."
+        # traceback dump instead of an honest, actionable answer.
+        _repair_orphaned_tool_calls(config)
+        response_text = (
+            "This request needed more steps than expected and was stopped "
+            "before finishing, so nothing here can be trusted as done. Try "
+            "asking again, or split it into smaller requests (one export, "
+            "one rename, one added column) instead of combining several in "
+            "one message.")
+        from app.logging_utils import log_interaction
+        from app.models import QueryPlan
+        log_interaction(session_id, file_id, prompt, QueryPlan(intent="general"),
+                        response_text, success=False,
+                        error="recursion_limit_reached",
+                        latency=time.time() - t0,
+                        tool_calls=_tool_calls_from_checkpoint(
+                            config, n_prior_messages))
+        return {
+            "response": response_text,
+            "intent": "error",
+            "file_id": file_id or app_state.get_active_file_id(),
+            "table": None,
+            "available_files": [
+                {"file_id": fid,
+                 "name": app_state.FILE_ORIGINAL_NAME.get(fid, fid),
+                 "kind": app_state.FILE_KIND.get(fid, "unknown")}
+                for fid in app_state.FILE_ORDER
+            ],
+        }
+
     except Exception as e:
         import traceback
         traceback.print_exc()
+        # Every OTHER failure path in this function logs what happened —
+        # this one, the last-resort catch-all, was the one gap left where a
+        # real failure never reached interaction_log.jsonl at all, so it
+        # could only ever be diagnosed by reproducing it live again.
+        try:
+            from app.logging_utils import log_interaction
+            from app.models import QueryPlan
+            log_interaction(session_id, file_id, prompt,
+                            QueryPlan(intent="general"),
+                            f"Something went wrong: {e}", success=False,
+                            error=str(e), latency=time.time() - t0)
+        except Exception:  # noqa: BLE001 -- logging must never mask the real error
+            pass
         return {
             "response": f"Something went wrong: {e}",
             "intent": "error",
@@ -2759,8 +3236,29 @@ def _tool_to_intent(tool_name: str) -> str:
         "modify_export": "export",
         "merge_files_side_by_side": "export",
         "combine_columns": "export",
+        "rename_column": "export",
+        "remove_column": "export",
+        "add_column": "export",
+        "add_data_row": "export",
+        "filter_rows": "export",
+        "fill_excel_template": "export",
+        "handle_duplicates": "export",
+        "style_excel": "export",
+        "merge_output_with_data": "export",
+        "add_excel_dropdown": "export",
+        "summarize_document": "summary",
+        "compare_documents": "compare",
+        "calculate_totals": "export",
+        "split_excel_by_column": "export",
+        "pivot_table": "export",
+        "extract_key_values": "qa",
+        "validate_data": "qa",
+        "create_summary_sheet": "export",
+        "web_search_procurement": "web_search",
         "get_file_overview": "overview",
         "get_page_content": "page_lookup",
+        "get_page_range": "page_lookup",
+        "search_by_keyword": "qa",
         "get_table_of_contents": "table_of_contents",
         "list_sheets": "list_sheets",
         "create_excel_template": "generate",

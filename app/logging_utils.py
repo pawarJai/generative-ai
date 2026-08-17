@@ -13,7 +13,7 @@ from app.config import LOG_PATH
 
 
 def log_interaction(session_id, file_id, prompt, plan, response, success,
-                     error=None, latency=None) -> str:
+                     error=None, latency=None, tool_calls=None) -> str:
     full_response = response if isinstance(response, str) else str(response)
     system_note = f"routed intent={getattr(plan, 'intent', None)}"
     if getattr(plan, "sink", None):
@@ -35,6 +35,15 @@ def log_interaction(session_id, file_id, prompt, plan, response, success,
         "latency_sec": round(latency, 2) if latency is not None else None,
         "prompt": prompt,
         "response": full_response,
+        # Every tool the agent actually called this turn, with the exact
+        # arguments it passed and what the tool returned — alongside the
+        # user's own prompt above. Confirmed need: every export bug in this
+        # project's history ("called export_data without file_id on retry",
+        # "the model never called modify_export at all") could only be
+        # confirmed before this by re-running the live server and reading
+        # the exported file back by hand; this puts that first check
+        # directly in the log line itself.
+        "tool_calls": tool_calls or [],
         "messages": [
             {"role": "system", "content": system_note},
             {"role": "user", "content": prompt},

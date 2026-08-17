@@ -7,6 +7,9 @@ __pycache__/
 # Virtual environments
 venv/
 .venv/
+venv*/
+env/
+ENV/
 
 # Environment / secrets
 .env
@@ -26,10 +29,34 @@ interaction_log.jsonl
 # Backup & corrupted state directories
 chroma_bge.bak-*/
 chroma_bge.corrupt-*/
+chroma_bge.hung-*/
+chroma_bge.*/
 
 # User data — ingested uploads and generated exports
 uploads/
 outputs/
+
+# Scratch notes and specs — briefs, transcripts and generated write-ups that
+# are working material, not source. Ignored by default so they stop showing
+# up in `git status`; anything meant to live in the repo is re-included
+# below. Note this only affects UNTRACKED files: CLAUDE.md, README.md,
+# requirements.txt and the docs/ notes are already tracked, so git keeps
+# managing them regardless of the patterns above them.
+*.md
+*.txt
+
+# ...except the ones that genuinely belong to the project.
+!CLAUDE.md
+!README.md
+!requirements*.txt
+!.gitignore
+!docs/**/*.md
+!**/README.md
+# Already committed before the blanket rule above existed. Ignoring a tracked
+# file does not untrack it, so without this negation git would keep versioning
+# it while reporting it as ignored. If it is not wanted in the repo, remove it
+# deliberately with `git rm --cached "Fix horizontal merge column combine.md"`.
+!Fix horizontal merge column combine.md
 
 # Claude-generated work-in-progress documents
 PLAN-*.md

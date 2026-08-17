@@ -75,6 +75,23 @@ def _clean(s: str) -> str:
     return re.sub(r"^[\s\"'“”]+|[\s\"'“”]+$", "", s).strip()
 
 
+# A rename clause naming a REAL column ("rename the column name = Description
+# in to Group") must never reach extract_requested_columns below — that
+# function matches any real column name found anywhere in the prompt, with
+# no requirement that the mention actually be a selection request. Confirmed
+# production failure (session 7e43a023, 2026-08-14): the rename clause's own
+# old-name "Description" is a real column, so extract_requested_columns read
+# it as "export only the Description column", silently dropping the other 7
+# real columns from an 8-column export — the same bug _mask_span already
+# guards against for filter clauses ("where Item Title = X"), just not yet
+# for rename ones. Not required to cleanly capture old/new names here (that
+# is app.export.modify's job) — only to cover the span so it gets masked.
+_RENAME_CLAUSE_RE = re.compile(
+    r"\brename\b\s+(?:the\s+)?(?:column\s+)?(?:name\s*[:=]\s*)?"
+    r"[\"'“]?(.+?)[\"'”]?\s+\b(?:in\s*to|into|to|as)\b\s+[\"'“]?([^\"'”,.]+)",
+    re.IGNORECASE)
+
+
 # --- explicit column selection --------------------------------------------
 
 def extract_requested_columns(prompt: str, available_columns: List[str]) -> List[str]:
@@ -409,6 +426,8 @@ def parse_and_apply(df: pd.DataFrame, prompt: str) -> Tuple[pd.DataFrame, List[s
         masked = _mask_span(masked, (_TOP_RE if kind == "head" else _BOTTOM_RE).search(prompt))
         out = apply_row_limit(out, limit)
         changes.append(f"kept {'top' if kind == 'head' else 'bottom'} {n} rows")
+
+    masked = _mask_span(masked, _RENAME_CLAUSE_RE.search(prompt))
 
     cols = extract_requested_columns(masked, list(out.columns))
     if cols:

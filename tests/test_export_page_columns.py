@@ -170,6 +170,34 @@ def test_page_export_selects_only_matched_real_columns(outdir, docling_pages, mo
     assert len(written) == 3
 
 
+REAL_RENAME_PROMPT = (
+    "on data-file-1 page number 6,8 check data and export this data in to "
+    "file name w1-03.xlsx first understand the data and than export it, "
+    "also rename the column name = Item in to Group")
+
+
+def test_page_export_applies_a_bundled_rename_without_a_second_tool_call(
+        outdir, docling_pages, monkeypatch):
+    """Confirmed production failure (session 7e43a023, 2026-08-14): asked
+    to export pages AND rename a column in the SAME message, the model
+    exported successfully but never called modify_export, then claimed the
+    rename had happened anyway — a file that on disk still had the
+    original column. The rename is now applied deterministically inside
+    the export itself, so the outcome no longer depends on the model
+    making a second tool call at all."""
+    from app import state as app_state
+    monkeypatch.setattr(app_state, "CURRENT_USER_PROMPT", REAL_RENAME_PROMPT)
+    out = A._deterministic_page_export("sbs-f1", [6, 8], "w1-03.xlsx", "excel")
+    assert "'Item' → 'Group'" in out
+    path = str(outdir / "w1-03.xlsx")
+    from app.export.exporters import band_offset
+    written = pd.read_excel(path, skiprows=band_offset(path))
+    # Every real column survives — the rename clause's own mention of
+    # "Item" must not narrow the export down to just that column.
+    assert set(written.columns) == {"SL no", "Group", "Spec No.", "Material code"}
+    assert len(written) == 3
+
+
 def test_page_export_reports_a_requested_column_that_is_not_real_data(
         outdir, docling_pages, monkeypatch):
     from app import state as app_state

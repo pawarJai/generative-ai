@@ -135,6 +135,45 @@ def test_a_column_name_ending_in_a_period_can_be_renamed():
     assert "no column named" not in result
 
 
+def test_rename_with_name_equals_and_typo_d_into_still_works():
+    """Confirmed production failure (session 7e43a023, 2026-08-14): 'rename
+    the column name = Item in to Group' — this user's actual, repeated
+    phrasing ('column NAME =' before the old name, 'in to' for 'into') — had
+    its old-name capture swallow 'name = Item in' whole, which matched no
+    real column, so the rename silently did nothing and the model reported
+    the failure by claiming the column it had just failed to find was
+    somehow already renamed."""
+    path, _ = _write("t-name-eq.xlsx", _frame())
+
+    result = modify("t-name-eq.xlsx", "rename the column name = Item in to Group")
+    columns = list(pd.read_excel(path, skiprows=band_offset(path)).columns)
+
+    assert "Group" in columns
+    assert "Item" not in columns
+    assert "no column named" not in result
+
+
+def test_a_rename_after_export_does_not_duplicate_an_existing_band():
+    """The reported failure showed the header band written twice in one
+    file, above a table that had also lost every column but one. Once the
+    export keeps all its columns and the rename resolves the real column on
+    the first try (both fixed above), a plain rename request — one with no
+    header/context words in it — must not touch the band that export_excel
+    already wrote."""
+    path, _ = _write("t-norepeat.xlsx", _frame())
+    offset_before = band_offset(path)
+    assert offset_before > 0
+
+    modify("t-norepeat.xlsx",
+          "rename the column name = Item in to Group, also add a column yard "
+          "number for this data")
+    sheet = load_workbook(path).active
+
+    assert band_offset(path) == offset_before
+    assert [sheet.cell(row=r, column=1).value
+            for r in range(1, offset_before + 1)].count("ACME SHIPYARD LTD") == 1
+
+
 def test_dropping_a_column():
     path, _ = _write("t-drop.xlsx", _frame())
 

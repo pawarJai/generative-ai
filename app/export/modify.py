@@ -41,8 +41,18 @@ _POSITIONAL_RENAME_RE = re.compile(
     r"[^.]{0,20}?\b(?:to|as|into)\b\s*(.+)", re.IGNORECASE)
 
 _NAMED_RENAME_RE = re.compile(
-    r"\brename\b\s+(?:the\s+)?(?:column\s+)?[\"'“]?(.+?)[\"'”]?\s+"
-    r"\b(?:to|as|into)\b\s+[\"'“]?([^\"'”,.]+)", re.IGNORECASE)
+    # "rename the column name = Description in to Group" is a real, repeated
+    # user phrasing — "column NAME =" before the old name (not just
+    # "column"), and "in to" as a typo'd "into". Without accounting for
+    # both, the old capture group swallowed "name = Description in" whole,
+    # which never matches any real column, so the rename silently failed —
+    # and the model, composing the final answer, described the failure as
+    # "the column 'Description' was not found" while the file it had just
+    # written still literally had that header. Confirmed production
+    # failure, session 7e43a023, 2026-08-14.
+    r"\brename\b\s+(?:the\s+)?(?:column\s+)?(?:name\s*[:=]\s*)?"
+    r"[\"'“]?(.+?)[\"'”]?\s+"
+    r"\b(?:in\s*to|into|to|as)\b\s+[\"'“]?([^\"'”,.]+)", re.IGNORECASE)
 
 _DROP_RE = re.compile(
     r"\b(?:remove|delete|drop|get rid of)\b\s+(?:the\s+)?[\"'“]?(.+?)[\"'”]?\s+columns?\b",

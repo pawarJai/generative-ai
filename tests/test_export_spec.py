@@ -158,6 +158,20 @@ def test_a_filter_clause_does_not_leak_into_column_selection():
     assert not any("kept only columns" in c for c in changes)
 
 
+def test_a_rename_clauses_own_column_name_does_not_leak_into_column_selection():
+    """Confirmed production failure (session 7e43a023, 2026-08-14): 'rename
+    the column name = Item Title in to Group' collapsed an 8-column page
+    export down to just 'Item Title', because that column name is real and
+    extract_requested_columns has no way to tell a bare mention in a rename
+    clause from an actual column-selection request. Same class of bug as
+    the filter-clause leak above, same fix — mask the clause out first."""
+    df = _frame()
+    out, changes = spec.parse_and_apply(
+        df, "rename the column name = Item Title in to Group")
+    assert list(out.columns) == list(df.columns)
+    assert not any("kept only columns" in c for c in changes)
+
+
 def test_combining_a_limit_and_a_column_selection():
     df = _frame()
     out, changes = spec.parse_and_apply(

@@ -176,6 +176,43 @@ def test_a_constant_overrides_a_real_document_match(outdir, monkeypatch):
     assert list(written["Item"]) == ["A", "B"]
 
 
+def test_omitting_file_id_resolves_the_same_document_as_passing_it_explicitly(
+        outdir, monkeypatch):
+    """Confirmed production failure (session 7e43a023, 6 files uploaded):
+    the model called this tool twice for one request, passing file_id the
+    first time and omitting it the second. With several files loaded, the
+    old resolution only auto-picked a document when EXACTLY ONE file was
+    uploaded, so the second call silently fell back to no document at all
+    and wrote a fully blank template where the first call had filled real
+    data — same request, same session, two contradictory files."""
+    from app import state as app_state
+    table = pd.DataFrame({
+        "Category": ["Ball Valve", "Gate Valve"],
+        "Rating": ["150#", "300#"],
+    })
+    monkeypatch.setattr("app.tables.helpers.get_all_real_tables",
+                        lambda fid, **kw: [table] if fid == "df2" else [])
+    monkeypatch.setattr(app_state, "FILE_ORDER", ["df1", "df2", "df3"])
+    monkeypatch.setitem(app_state.FILE_KIND, "df2", "docling")
+    monkeypatch.setattr(app_state, "FILE_ORIGINAL_NAME", {"df2": "data-file-2.pdf"})
+    monkeypatch.setattr(app_state, "ACTIVE_FILE_ID", "df2")
+    monkeypatch.setattr(app_state, "CURRENT_USER_PROMPT",
+                        "create excel with columns = Category, Rating")
+
+    with_id = create_excel_template.invoke({
+        "columns": ["Category", "Rating"], "filename": "t-with-id.xlsx",
+        "file_id": "df2"})
+    without_id = create_excel_template.invoke({
+        "columns": ["Category", "Rating"], "filename": "t-without-id.xlsx"})
+
+    assert "Filled from" in with_id
+    assert "Filled from" in without_id
+    w1 = pd.read_excel(outdir / "t-with-id.xlsx")
+    w2 = pd.read_excel(outdir / "t-without-id.xlsx")
+    assert list(w1["Category"]) == list(w2["Category"]) == ["Ball Valve", "Gate Valve"]
+    assert list(w1["Rating"]) == list(w2["Rating"]) == ["150#", "300#"]
+
+
 # --- export_data's own fallback, end to end --------------------------------
 
 def test_export_data_falls_back_to_a_template_with_nothing_uploaded(outdir, monkeypatch):
